@@ -1,0 +1,13 @@
+name: Trigger on PR
+
+on:
+  pull_request:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-image:
+    uses: ./.github/workflows/build-image.yaml
+    secrets: inherit
