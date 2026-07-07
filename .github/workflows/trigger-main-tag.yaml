@@ -1,0 +1,13 @@
+name: Trigger on Merge to Main / Tag
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '*'
+
+jobs:
+  build-image:
+    uses: ./.github/workflows/build-image.yaml
+    secrets: inherit
