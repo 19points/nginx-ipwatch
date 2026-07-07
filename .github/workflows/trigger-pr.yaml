@@ -3,6 +3,10 @@ name: Trigger on PR
 on:
   pull_request:
 
+permissions:
+  contents: read
+  packages: write
+
 concurrency:
   group: ${{ github.ref }}
   cancel-in-progress: true

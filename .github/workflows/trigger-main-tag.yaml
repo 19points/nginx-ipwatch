@@ -7,6 +7,10 @@ on:
     tags:
       - '*'
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-image:
     uses: ./.github/workflows/build-image.yaml
