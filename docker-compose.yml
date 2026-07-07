@@ -1,0 +1,25 @@
+services:
+  watcher:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - /var/log/nginx:/logs:ro
+      - ./data:/data
+    environment:
+      LOG_PATH: /logs/access.log
+      DB_PATH: /data/nginx_ips.db
+      # IGNORE_IPS: "127.0.0.1,::1,10.0.0.1"
+    command: ["python", "-u", "nginx-ipwatch.py"]
+
+  web:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      DB_PATH: /data/nginx_ips.db
+    command: ["gunicorn", "web:app", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "30"]
+    ports:
+      - "5000:5000"
+    depends_on:
+      - watcher
