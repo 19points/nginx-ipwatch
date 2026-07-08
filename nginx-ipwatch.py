@@ -84,7 +84,7 @@ def whois_lookup(ip: str) -> tuple[str, str]:
         net     = data.get("network") or {}
         network = net.get("cidr") or ""
         country = net.get("country") or data.get("asn_country_code") or ""
-        return network, country
+        return network, country.upper()
     except IPDefinedError:
         # RFC-1918 / loopback / link-local
         return "private", "private"
