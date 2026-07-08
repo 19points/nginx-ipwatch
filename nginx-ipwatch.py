@@ -21,8 +21,7 @@ import sqlite3
 import signal
 from datetime import datetime, timezone
 
-from ipwhois import IPWhois
-from ipwhois.exceptions import IPDefinedError
+from whois_util import whois_lookup
 
 DEFAULT_LOG = "/logs/access.log"
 DEFAULT_DB  = "/data/nginx_ips.db"
@@ -32,6 +31,13 @@ IGNORE_IPS: set[str] = {
     for ip in os.environ.get("IGNORE_IPS", "").split(",")
     if ip.strip()
 }
+
+# Periodic retry of rows whose WHOIS lookup previously failed (network IS NULL).
+# A failed lookup is only ever attempted once at insert time, so without this a
+# transient rate-limit/timeout would leave a row blank forever.
+BACKFILL_INTERVAL = int(os.environ.get("BACKFILL_INTERVAL", "900"))   # seconds between sweeps
+BACKFILL_BATCH    = int(os.environ.get("BACKFILL_BATCH", "25"))       # max rows retried per sweep
+WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "1.0"))       # seconds between lookups (rate-limit friendly)
 
 
 # ---------------------------------------------------------------------------
@@ -69,28 +75,39 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
             "VALUES (?, ?, ?, 1, ?)",
             (ip, network, country, now),
         )
-        print(f"[new]  {ip:<40}  net={network:<20}  country={country}", flush=True)
+        if network is None:
+            # Lookup failed — stored as NULL so the backfill sweep retries it.
+            print(f"[new]  {ip:<40}  WHOIS lookup failed — will retry", flush=True)
+        else:
+            print(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}", flush=True)
 
     conn.commit()
 
 
-# ---------------------------------------------------------------------------
-# WHOIS
-# ---------------------------------------------------------------------------
+def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
+    """Retry WHOIS for up to *limit* rows whose lookup previously failed.
 
-def whois_lookup(ip: str) -> tuple[str, str]:
-    try:
-        data = IPWhois(ip).lookup_rdap(depth=1)
-        net     = data.get("network") or {}
-        network = net.get("cidr") or ""
-        country = net.get("country") or data.get("asn_country_code") or ""
-        return network, country.upper()
-    except IPDefinedError:
-        # RFC-1918 / loopback / link-local
-        return "private", "private"
-    except Exception as exc:
-        print(f"[whois error {ip}] {exc}", file=sys.stderr, flush=True)
-        return "", ""
+    Only touches rows where network IS NULL (a failed lookup). Rows with a
+    successful-but-empty result ('') are left alone so genuinely data-less IPs
+    aren't retried forever. Rows that fail again stay NULL for the next sweep.
+    """
+    rows = conn.execute(
+        "SELECT ip FROM ip_access WHERE network IS NULL LIMIT ?", (limit,)
+    ).fetchall()
+    if not rows:
+        return
+
+    print(f"[backfill] retrying {len(rows)} IP(s) with previously failed lookups", flush=True)
+    for (ip,) in rows:
+        network, country = whois_lookup(ip)
+        if network is not None:
+            conn.execute(
+                "UPDATE ip_access SET network = ?, country = ? WHERE ip = ?",
+                (network, country, ip),
+            )
+            conn.commit()
+            print(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}", flush=True)
+        time.sleep(delay)  # throttle to stay under RDAP rate limits
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +130,9 @@ def tail(path: str):
     """
     Yield new lines appended to *path*.
     Handles log rotation by detecting inode changes.
+
+    Yields None while idle (no new line) so the caller can run periodic
+    maintenance — e.g. the backfill sweep — even during quiet periods.
     """
     inode = os.stat(path).st_ino
     fh    = open(path)
@@ -125,6 +145,7 @@ def tail(path: str):
                 yield line
                 continue
 
+            yield None  # idle heartbeat
             time.sleep(0.05)
 
             try:
@@ -166,8 +187,17 @@ def main() -> None:
     if IGNORE_IPS:
         print(f"[info] ignoring {len(IGNORE_IPS)} IP(s): {', '.join(sorted(IGNORE_IPS))}", flush=True)
     print(f"[info] watching {log_path}  →  {db_path}", flush=True)
+    print(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/lookup)", flush=True)
 
+    last_backfill = time.monotonic()
     for line in tail(log_path):
+        if time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
+            backfill(conn, BACKFILL_BATCH, WHOIS_DELAY)
+            last_backfill = time.monotonic()
+
+        if line is None:  # idle heartbeat — nothing to process this tick
+            continue
+
         ip = extract_ip(line)
         if ip is None or ip in IGNORE_IPS:
             continue

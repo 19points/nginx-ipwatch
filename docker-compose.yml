@@ -9,6 +9,10 @@ services:
       LOG_PATH: /logs/access.log
       DB_PATH: /data/nginx_ips.db
       # IGNORE_IPS: "127.0.0.1,::1,10.0.0.1"
+      # Retry lookups that failed (rate limit / timeout). Defaults shown:
+      # BACKFILL_INTERVAL: "900"   # seconds between retry sweeps
+      # BACKFILL_BATCH: "25"       # max rows retried per sweep
+      # WHOIS_DELAY: "1.0"         # seconds between lookups
     command: ["python", "-u", "nginx-ipwatch.py"]
 
   web:
