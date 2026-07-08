@@ -1,8 +1,13 @@
 {% extends "base.html" %}
+{% block title %}nginx-ipwatch — networks{% endblock %}
 {% block content %}
 
 <!-- ── Stats ──────────────────────────────────────────────── -->
 <div class="stats">
+  <div class="stat-card">
+    <div class="label">Networks</div>
+    <div class="value">{{ '{:,}'.format(stats['total_networks'] or 0) }}</div>
+  </div>
   <div class="stat-card">
     <div class="label">Unique IPs</div>
     <div class="value">{{ '{:,}'.format(stats['total_ips'] or 0) }}</div>
@@ -11,16 +16,11 @@
     <div class="label">Total Requests</div>
     <div class="value">{{ '{:,}'.format(stats['total_requests'] or 0) }}</div>
   </div>
-  <div class="stat-card">
-    <div class="label">Countries</div>
-    <div class="value">{{ stats['total_countries'] or 0 }}</div>
-  </div>
 </div>
 
 <!-- ── Filters ────────────────────────────────────────────── -->
-<form class="filters" method="get" action="/">
-  <input type="text" name="ip" placeholder="Search IP…" value="{{ search_ip }}" autocomplete="off">
-  {% if network %}<input type="hidden" name="network" value="{{ network }}">{% endif %}
+<form class="filters" method="get" action="/networks">
+  <input type="text" name="network" placeholder="Search network…" value="{{ search_net }}" autocomplete="off">
 
   <select name="country">
     <option value="">All countries</option>
@@ -30,10 +30,10 @@
   </select>
 
   <select name="sort">
+    <option value="ip_count"  {% if sort == 'ip_count'  %}selected{% endif %}>Sort: IPs</option>
     <option value="requests"  {% if sort == 'requests'  %}selected{% endif %}>Sort: Requests</option>
     <option value="last_seen" {% if sort == 'last_seen' %}selected{% endif %}>Sort: Last Seen</option>
     <option value="country"   {% if sort == 'country'   %}selected{% endif %}>Sort: Country</option>
-    <option value="ip"        {% if sort == 'ip'        %}selected{% endif %}>Sort: IP</option>
     <option value="network"   {% if sort == 'network'   %}selected{% endif %}>Sort: Network</option>
   </select>
 
@@ -43,24 +43,18 @@
   </select>
 
   <button type="submit" class="btn btn-primary">Apply</button>
-  <a href="/" class="btn btn-reset">Reset</a>
+  <a href="/networks" class="btn btn-reset">Reset</a>
 </form>
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) %}
+{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country %}
 <div class="result-meta">
   {% if total == 0 %}
-    No results{% if search_ip or sel_country or network %} for current filters{% endif %}.
+    No results{% if search_net or sel_country %} for current filters{% endif %}.
   {% else %}
     Showing {{ (page - 1) * per_page + 1 }}–{{ [(page - 1) * per_page + rows|length, total]|min }}
-    of {{ '{:,}'.format(total) }} IP{% if total != 1 %}s{% endif %}
-    {% if search_ip or sel_country or network %}(filtered){% endif %}
-  {% endif %}
-  {% if network %}
-    <span class="filter-chip">
-      network <code>{{ network }}</code>
-      <a href="/?ip={{ search_ip }}&country={{ sel_country }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear network filter">✕</a>
-    </span>
+    of {{ '{:,}'.format(total) }} network{% if total != 1 %}s{% endif %}
+    {% if search_net or sel_country %}(filtered){% endif %}
   {% endif %}
 </div>
 
@@ -70,11 +64,11 @@
 <table>
   <thead>
     <tr>
-      {% set cols = [('ip','IP Address'), ('network','Network'), ('country','Country'), ('requests','Requests'), ('last_seen','Last Seen (UTC)')] %}
+      {% set cols = [('network','Network'), ('country','Country'), ('ip_count','IPs'), ('requests','Requests'), ('last_seen','Last Seen (UTC)')] %}
       {% for col_key, col_label in cols %}
       {% set next_order = 'asc' if (sort == col_key and order == 'DESC') else 'desc' %}
       <th>
-        <a href="/?{{ base_qs }}&sort={{ col_key }}&order={{ next_order }}&page=1">
+        <a href="/networks?{{ base_qs }}&sort={{ col_key }}&order={{ next_order }}&page=1">
           {{ col_label }}
           {% if sort == col_key %}
             <span class="sort-icon active">{{ '↓' if order == 'DESC' else '↑' }}</span>
@@ -89,40 +83,44 @@
   <tbody>
     {% for row in rows %}
     <tr>
-      <td><code class="copyable" onclick="copy(this, '{{ row['ip'] }}')" title="Click to copy">{{ row['ip'] }}</code></td>
       <td>
         {% if row['network'] %}
-          {% for cidr in row['network'].split(',') %}
-            {% set cidr = cidr.strip() %}
-            <span class="network-text copyable" onclick="copy(this, '{{ cidr }}')" title="Click to copy">{{ cidr }}</span>{% if not loop.last %} {% endif %}
+          <a class="network-link" href="/?network={{ row['network'] | urlencode }}" title="View IPs in this network">
+            {% for cidr in row['network'].split(',') %}
+              <span class="network-text">{{ cidr.strip() }}</span>{% if not loop.last %} {% endif %}
+            {% endfor %}
+          </a>
+        {% else %}
+          <span style="color:#aaa">(unknown)</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if row['countries'] %}
+          {% for c in row['countries'].split(',') %}
+            {% set c = c.strip() %}
+            {% set is_private = c == 'private' %}
+            <a href="/networks?country={{ c }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
+               class="badge{{ ' badge-private' if is_private else '' }}">{{ c }}</a>{% if not loop.last %} {% endif %}
           {% endfor %}
         {% else %}
           <span style="color:#aaa">—</span>
         {% endif %}
       </td>
-      <td>
-        {% if row['country'] %}
-          {% set is_private = row['country'] == 'private' %}
-          <a href="/?country={{ row['country'] }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
-             class="badge{{ ' badge-private' if is_private else '' }}">{{ row['country'] }}</a>
-        {% else %}
-          <span style="color:#aaa">—</span>
-        {% endif %}
-      </td>
-      <td><span class="req-count">{{ '{:,}'.format(row['requests']) }}</span></td>
+      <td><span class="ip-count">{{ '{:,}'.format(row['ip_count']) }}</span></td>
+      <td><span class="req-count">{{ '{:,}'.format(row['total_requests']) }}</span></td>
       <td><span class="ts">{{ row['last_seen'] }}</span></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 {% else %}
-<div class="no-results">No IP addresses recorded yet{% if search_ip or sel_country or network %} matching the current filters{% endif %}.</div>
+<div class="no-results">No networks recorded yet{% if search_net or sel_country %} matching the current filters{% endif %}.</div>
 {% endif %}
 </div>
 
 <!-- ── Pagination ─────────────────────────────────────────── -->
 {% if total_pages > 1 %}
-{% set pqs = '/?' ~ base_qs ~ '&sort=' ~ sort ~ '&order=' ~ ('desc' if order == 'DESC' else 'asc') %}
+{% set pqs = '/networks?' ~ base_qs ~ '&sort=' ~ sort ~ '&order=' ~ ('desc' if order == 'DESC' else 'asc') %}
 <div class="pagination">
   {% if page > 1 %}
   <a href="{{ pqs }}&page={{ page - 1 }}">← Prev</a>

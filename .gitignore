@@ -1,0 +1,20 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data — the SQLite DB and its mounted volume
+/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS / editor cruft
+.DS_Store
+*.swp
