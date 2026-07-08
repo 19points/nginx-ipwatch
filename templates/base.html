@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}nginx-ipwatch{% endblock %}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Avenir Next', 'Avenir', 'Nunito Sans', 'Segoe UI', sans-serif;
+      background: #f0f4f9;
+      color: #000;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: #054A91;
+      color: #fff;
+      padding: 0.9rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      box-shadow: 0 2px 6px rgba(0,0,0,.25);
+    }
+    header h1 { font-weight: bold; font-size: 1.25rem; letter-spacing: .02em; }
+    header .sub { opacity: .65; font-size: .85rem; }
+
+    /* ── Nav ── */
+    header nav { display: flex; gap: .25rem; margin-left: 1rem; }
+    header nav a {
+      color: #fff;
+      text-decoration: none;
+      font-size: .85rem;
+      padding: .35rem .85rem;
+      border-radius: 6px;
+      opacity: .7;
+      transition: background .15s, opacity .15s;
+    }
+    header nav a:hover { opacity: 1; background: rgba(255,255,255,.12); }
+    header nav a.active { opacity: 1; background: rgba(255,255,255,.2); font-weight: bold; }
+
+    .refresh-toggle {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+      font-size: .82rem;
+      opacity: .8;
+    }
+    .refresh-toggle input { accent-color: #02BD9D; cursor: pointer; }
+    .refresh-toggle label { cursor: pointer; }
+
+    /* ── Stats ── */
+    .stats {
+      display: flex;
+      gap: 1.25rem;
+      padding: 1.25rem 2rem;
+      flex-wrap: wrap;
+    }
+    .stat-card {
+      background: #fff;
+      border: 1px solid #d6e4f4;
+      border-radius: 10px;
+      padding: .9rem 1.5rem;
+      min-width: 155px;
+      flex: 1;
+      max-width: 220px;
+    }
+    .stat-card .label {
+      font-size: .7rem;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: #555;
+      font-weight: bold;
+    }
+    .stat-card .value {
+      font-size: 2rem;
+      font-weight: bold;
+      color: #054A91;
+      margin-top: .2rem;
+    }
+
+    /* ── Filters ── */
+    .filters {
+      background: #fff;
+      border-top: 1px solid #d6e4f4;
+      border-bottom: 1px solid #d6e4f4;
+      padding: .85rem 2rem;
+      display: flex;
+      gap: .75rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .filters input[type=text],
+    .filters select {
+      font-family: inherit;
+      font-size: .875rem;
+      padding: .45rem .75rem;
+      border: 1px solid #b0c9e8;
+      border-radius: 6px;
+      background: #f8fbff;
+      color: #000;
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .filters input[type=text]:focus,
+    .filters select:focus {
+      border-color: #3E7CB1;
+      box-shadow: 0 0 0 3px rgba(125,193,241,.35);
+    }
+    .filters input[name=ip],
+    .filters input[name=network] { width: 180px; }
+    .btn {
+      font-family: inherit;
+      font-size: .875rem;
+      font-weight: bold;
+      padding: .45rem 1.2rem;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn-primary { background: #054A91; color: #fff; }
+    .btn-primary:hover { background: #3E7CB1; }
+    .btn-reset {
+      background: transparent;
+      color: #3E7CB1;
+      border: 1px solid #b0c9e8;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+    }
+    .btn-reset:hover { background: #f0f4f9; }
+
+    /* ── Result meta ── */
+    .result-meta {
+      padding: .6rem 2rem .3rem;
+      font-size: .8rem;
+      color: #666;
+    }
+    .filter-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: .4em;
+      background: #d6eafa;
+      color: #054A91;
+      border-radius: 5px;
+      padding: .1em .55em;
+      font-size: .8rem;
+      margin-left: .35rem;
+    }
+    .filter-chip code { color: #054A91; }
+    .filter-chip a {
+      color: #3E7CB1;
+      text-decoration: none;
+      font-weight: bold;
+    }
+    .filter-chip a:hover { color: #054A91; }
+
+    /* ── Table ── */
+    .table-wrap { padding: .5rem 2rem 1.5rem; overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      font-size: .875rem;
+    }
+    thead th {
+      background: #054A91;
+      color: #fff;
+      padding: .7rem 1rem;
+      text-align: left;
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      white-space: nowrap;
+      user-select: none;
+    }
+    thead th a {
+      color: #fff;
+      text-decoration: none;
+      display: flex;
+      align-items: center;
+      gap: .3em;
+    }
+    thead th a:hover { text-decoration: underline; }
+    .sort-icon { opacity: .55; font-size: .9em; }
+    .sort-icon.active { opacity: 1; color: #7DC1F1; }
+
+    tbody tr { border-bottom: 1px solid #edf2f8; transition: background .1s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:nth-child(even) { background: #f7fafd; }
+    tbody tr:hover { background: #e4f0fa; }
+    tbody td { padding: .6rem 1rem; vertical-align: middle; }
+
+    code {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: .85em;
+      color: #054A91;
+    }
+    .network-text { font-size: .82rem; color: #3E7CB1; }
+    .network-link { text-decoration: none; }
+    .network-link:hover .network-text { text-decoration: underline; }
+
+    .badge {
+      display: inline-block;
+      padding: .18em .65em;
+      border-radius: 5px;
+      font-size: .78rem;
+      font-weight: bold;
+      background: #d6eafa;
+      color: #054A91;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: background .15s;
+    }
+    .badge:hover { background: #7DC1F1; }
+    .badge-private { background: #e8e8e8; color: #555; }
+    .badge-private:hover { background: #d0d0d0; }
+
+    .req-count { font-weight: bold; color: #054A91; }
+    .ip-count { font-weight: bold; color: #02BD9D; }
+    .ts { color: #555; font-size: .82rem; white-space: nowrap; }
+
+    /* ── Copy-to-clipboard ── */
+    .copyable {
+      cursor: pointer;
+      position: relative;
+      border-radius: 3px;
+      transition: background .15s, color .15s;
+    }
+    .copyable:hover { background: #d6eafa; }
+    .copyable::after {
+      content: '⎘';
+      font-size: .7em;
+      margin-left: .3em;
+      opacity: 0;
+      transition: opacity .15s;
+      vertical-align: middle;
+    }
+    .copyable:hover::after { opacity: .5; }
+    .copyable.copied { background: #02BD9D22 !important; color: #02BD9D !important; }
+    .copyable.copied::after { content: '✓'; opacity: 1; color: #02BD9D; }
+
+    .no-results {
+      text-align: center;
+      padding: 3.5rem 1rem;
+      color: #888;
+      font-size: .95rem;
+    }
+
+    /* ── Pagination ── */
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: .4rem;
+      padding: 0 2rem 2rem;
+      flex-wrap: wrap;
+    }
+    .pagination a,
+    .pagination span {
+      display: inline-flex;
+      align-items: center;
+      padding: .35rem .8rem;
+      border-radius: 6px;
+      font-size: .875rem;
+      text-decoration: none;
+      border: 1px solid #b0c9e8;
+      color: #054A91;
+      background: #fff;
+      transition: background .15s;
+    }
+    .pagination a:hover { background: #d6eafa; }
+    .pagination span.current {
+      background: #054A91;
+      color: #fff;
+      border-color: #054A91;
+      font-weight: bold;
+    }
+    .pagination span.ellipsis {
+      border: none;
+      background: transparent;
+      color: #888;
+      padding: .35rem .3rem;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────── -->
+<header>
+  <h1>nginx-ipwatch</h1>
+  <span class="sub">IP access tracker</span>
+  <nav>
+    <a href="/"{% if view == 'ips' %} class="active"{% endif %}>IPs</a>
+    <a href="/networks"{% if view == 'networks' %} class="active"{% endif %}>Networks</a>
+  </nav>
+  <div class="refresh-toggle">
+    <input type="checkbox" id="autorefresh">
+    <label for="autorefresh">auto-refresh 30s</label>
+  </div>
+</header>
+
+{% block content %}{% endblock %}
+
+<script>
+  // ── Auto-refresh (persisted across reloads via localStorage) ──
+  const cb = document.getElementById('autorefresh');
+  let timer = null;
+
+  function startTimer() {
+    timer = setInterval(() => location.reload(), 30_000);
+  }
+
+  if (localStorage.getItem('autorefresh') === 'true') {
+    cb.checked = true;
+    startTimer();
+  }
+
+  cb.addEventListener('change', () => {
+    clearInterval(timer);
+    localStorage.setItem('autorefresh', cb.checked);
+    if (cb.checked) startTimer();
+  });
+
+  // ── Copy to clipboard ──
+  function copy(el, text) {
+    navigator.clipboard.writeText(text).then(() => {
+      el.classList.add('copied');
+      setTimeout(() => el.classList.remove('copied'), 1500);
+    });
+  }
+</script>
+
+</body>
+</html>
