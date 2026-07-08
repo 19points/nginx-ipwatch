@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY nginx-ipwatch.py web.py ./
+COPY nginx-ipwatch.py web.py whois_util.py backfill.py ./
 COPY templates/ templates/
 
 # /logs — mount your Nginx log directory here (read-only)
