@@ -292,6 +292,20 @@
       color: #888;
       padding: .35rem .3rem;
     }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center;
+      padding: 1.5rem 2rem 2rem;
+      font-size: .8rem;
+      color: #666;
+    }
+    footer a {
+      color: #3E7CB1;
+      text-decoration: none;
+      font-weight: bold;
+    }
+    footer a:hover { color: #054A91; text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -311,6 +325,12 @@
 </header>
 
 {% block content %}{% endblock %}
+
+<!-- ── Footer ─────────────────────────────────────────────── -->
+<footer>
+  Made by <a href="https://19points.lv/" target="_blank" rel="noopener">19 points</a>,
+  <a href="https://github.com/19points/nginx-ipwatch" target="_blank" rel="noopener">source</a>
+</footer>
 
 <script>
   // ── Auto-refresh (persisted across reloads via localStorage) ──
