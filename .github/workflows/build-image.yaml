@@ -51,9 +51,14 @@ jobs:
         id: docker_build
         uses: docker/build-push-action@v6
         with:
-          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Old Docker (< 20.10, e.g. 19.03) can't pull OCI-format manifests or
+          # provenance attestation image-indexes. Disable provenance and force
+          # Docker schema2 media types so legacy engines can pull these images.
+          provenance: false
+          sbom: false
+          outputs: type=image,oci-mediatypes=false,push=${{ github.event_name != 'pull_request' }}
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
