@@ -104,3 +104,7 @@ sqlite3 data/nginx_ips.db \
 - Log rotation is handled automatically via inode detection.
 - The web process opens the database read-only; only the watcher ever writes to it.
 - All timestamps are stored in UTC.
+
+## License
+
+Released under the [MIT License](LICENSE). Made by [19 points](https://19points.lv/).
