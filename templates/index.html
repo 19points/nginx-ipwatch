@@ -25,7 +25,7 @@
   <select name="country">
     <option value="">All countries</option>
     {% for c in countries %}
-    <option value="{{ c }}"{% if c == sel_country %} selected{% endif %}>{{ c }}</option>
+    <option value="{{ c }}"{% if c == sel_country %} selected{% endif %}>{{ c | flag }} {{ c }}</option>
     {% endfor %}
   </select>
 
@@ -123,7 +123,7 @@
         {% if row['country'] %}
           {% set is_private = row['country'] == 'private' %}
           <a href="/?country={{ row['country'] }}&period={{ period }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
-             class="badge{{ ' badge-private' if is_private else '' }}">{{ row['country'] }}</a>
+             class="badge{{ ' badge-private' if is_private else '' }}">{{ row['country'] | flag }} {{ row['country'] }}</a>
         {% else %}
           <span style="color:#aaa">—</span>
         {% endif %}

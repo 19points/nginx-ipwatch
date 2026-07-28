@@ -99,6 +99,26 @@ NET_SORT_COLS = {
 }
 
 
+def flag_emoji(code: str) -> str:
+    """Render an ISO 3166-1 alpha-2 country code as a flag emoji.
+
+    Maps each letter to its regional-indicator symbol (A -> U+1F1E6). Returns a
+    house glyph for our synthetic 'private' country and '' for anything that
+    isn't a 2-letter code (empty/unknown), so callers can prepend unconditionally.
+    """
+    if not code:
+        return ""
+    if code.lower() == "private":
+        return "🏠"
+    if len(code) != 2 or not code.isalpha():
+        return ""
+    code = code.upper()
+    return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
+
+
+app.jinja_env.filters["flag"] = flag_emoji
+
+
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         try:
