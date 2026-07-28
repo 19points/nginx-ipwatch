@@ -115,6 +115,13 @@
     }
     .filters input[name=ip],
     .filters input[name=network] { width: 180px; }
+    /* Exclude fields — subtle red tint to read as "remove/negative". */
+    .filters input.ex { width: 160px; background: #fff6f6; border-color: #e6b8b8; }
+    .filters input.ex::placeholder { color: #b98a8a; }
+    .filters input.ex:focus {
+      border-color: #c97b7b;
+      box-shadow: 0 0 0 3px rgba(201,123,123,.28);
+    }
     .btn {
       font-family: inherit;
       font-size: .875rem;

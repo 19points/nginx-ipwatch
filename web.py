@@ -39,6 +39,33 @@ PERIODS = {
 _PERIOD_HOURS = {"1h": 1, "3h": 3, "6h": 6, "12h": 12, "24h": 24, "7d": 24 * 7}
 
 
+def _terms(raw: str) -> list:
+    """Split a comma-separated exclude field into trimmed, non-empty terms."""
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def exclude_conditions(xip: str, xnet: str, xcountry: str) -> tuple[list, list]:
+    """SQL conditions that drop rows matching any exclude term.
+
+    IP/network use substring (NOT LIKE) to mirror the include search boxes;
+    country is exact (NOT IN). NULL network/country (unresolved WHOIS) is kept
+    rather than dropped, so an exclude never hides not-yet-looked-up rows.
+    """
+    conds, params = [], []
+    for t in _terms(xip):
+        conds.append("ip NOT LIKE ?")
+        params.append(f"%{t}%")
+    for t in _terms(xnet):
+        conds.append("(network IS NULL OR network NOT LIKE ?)")
+        params.append(f"%{t}%")
+    xc = _terms(xcountry)
+    if xc:
+        placeholders = ",".join("?" * len(xc))
+        conds.append(f"(country IS NULL OR country NOT IN ({placeholders}))")
+        params.extend(xc)
+    return conds, params
+
+
 def period_bounds(period: str) -> tuple[list, list]:
     """SQL conditions restricting last_seen to *period*.
 
@@ -109,6 +136,9 @@ def index():
     country   = request.args.get("country", "").strip()
     network   = request.args.get("network", "").strip()
     period    = request.args.get("period", "all")
+    xip       = request.args.get("xip", "").strip()
+    xnet      = request.args.get("xnet", "").strip()
+    xcountry  = request.args.get("xcountry", "").strip()
     sort      = request.args.get("sort", "requests")
     order     = request.args.get("order", "desc")
     page      = max(1, int(request.args.get("page", 1) or 1))
@@ -129,6 +159,10 @@ def index():
     if network:
         conditions.append("network = ?")
         params.append(network)
+
+    xconds, xparams = exclude_conditions(xip, xnet, xcountry)
+    conditions += xconds
+    params += xparams
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -173,6 +207,9 @@ def index():
         search_ip=search_ip,
         sel_country=country,
         network=network,
+        xip=xip,
+        xnet=xnet,
+        xcountry=xcountry,
         sort=sort,
         order=order,
         page=page,
@@ -195,6 +232,9 @@ def networks():
     search_net = request.args.get("network", "").strip()
     country    = request.args.get("country", "").strip()
     period     = request.args.get("period", "all")
+    xip        = request.args.get("xip", "").strip()
+    xnet       = request.args.get("xnet", "").strip()
+    xcountry   = request.args.get("xcountry", "").strip()
     sort       = request.args.get("sort", "ip_count")
     order      = request.args.get("order", "desc")
     page       = max(1, int(request.args.get("page", 1) or 1))
@@ -213,6 +253,10 @@ def networks():
     if country:
         conditions.append("country = ?")
         params.append(country)
+
+    xconds, xparams = exclude_conditions(xip, xnet, xcountry)
+    conditions += xconds
+    params += xparams
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
@@ -261,6 +305,9 @@ def networks():
         period=period,
         search_net=search_net,
         sel_country=country,
+        xip=xip,
+        xnet=xnet,
+        xcountry=xcountry,
         sort=sort,
         order=order,
         page=page,
