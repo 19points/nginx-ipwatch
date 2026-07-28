@@ -27,7 +27,14 @@ import sqlite3
 import sys
 import time
 
-from whois_util import next_retry_after, whois_lookup
+from whois_util import (
+    cache_add,
+    cache_lookup,
+    is_private,
+    next_retry_after,
+    prime_cache,
+    whois_lookup,
+)
 
 DEFAULT_DB = "/data/nginx_ips.db"
 
@@ -40,8 +47,8 @@ def main() -> None:
                         help="also retry rows with an empty ('') network (legacy failures)")
     parser.add_argument("--limit", type=int, default=0,
                         help="max rows to process (0 = no limit)")
-    parser.add_argument("--delay", type=float, default=float(os.environ.get("WHOIS_DELAY", "1.0")),
-                        help="seconds to sleep between lookups (rate-limit friendly)")
+    parser.add_argument("--delay", type=float, default=float(os.environ.get("WHOIS_DELAY", "2.0")),
+                        help="seconds to sleep between live lookups (rate-limit friendly)")
     args = parser.parse_args()
 
     if not os.path.exists(args.db_path):
@@ -62,12 +69,27 @@ def main() -> None:
         print("Nothing to backfill — no matching rows.")
         return
 
+    primed = prime_cache(conn)
     print(f"Backfilling {len(rows)} row(s) from {args.db_path} "
-          f"({'NULL + empty' if args.include_empty else 'NULL only'}, {args.delay}s/lookup)")
+          f"({'NULL + empty' if args.include_empty else 'NULL only'}, {args.delay}s/live lookup, "
+          f"cache primed with {primed} CIDR(s))")
 
     fixed = failed = unchanged = 0
     for ip, attempts in rows:
-        network, country = whois_lookup(ip)
+        # Resolve for free first (private range or inside a cached CIDR); only a
+        # genuinely unknown public network needs a live, throttled WHOIS call.
+        if is_private(ip):
+            network, country, live = "private", "private", False
+        else:
+            hit = cache_lookup(ip)
+            if hit:
+                network, country, live = hit[0], hit[1], False
+            else:
+                network, country = whois_lookup(ip)
+                live = True
+        if network is not None and live and network not in ("", "private"):
+            cache_add(network, country)  # first IP of a block seeds its siblings
+
         if network is None:
             # Still failing — record the attempt and push the retry out so the
             # watcher's backoff schedule stays coherent after a manual run.
@@ -88,13 +110,15 @@ def main() -> None:
             conn.commit()
         else:
             fixed += 1
-            print(f"  [ok]    {ip:<40}  net={network:<20}  country={country or '-'}")
+            src = "" if live else "  (cached)"
+            print(f"  [ok]    {ip:<40}  net={network:<20}  country={country or '-'}{src}")
             conn.execute(
                 "UPDATE ip_access SET network = ?, country = ?, whois_next_retry = NULL WHERE ip = ?",
                 (network, country, ip),
             )
             conn.commit()
-        time.sleep(args.delay)
+        if live:
+            time.sleep(args.delay)  # throttle only real network calls; cache hits are free
 
     conn.close()
     print(f"\nDone. resolved={fixed}  no-data={unchanged}  still-failing={failed}")
