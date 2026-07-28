@@ -40,6 +40,12 @@ BACKFILL_BATCH    = int(os.environ.get("BACKFILL_BATCH", "25"))       # max rows
 WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "1.0"))       # seconds between lookups (rate-limit friendly)
 
 
+def log(msg: str) -> None:
+    """Print *msg* to stdout prefixed with a UTC timestamp (same format as last_seen)."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts}  {msg}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
@@ -77,9 +83,9 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
         )
         if network is None:
             # Lookup failed — stored as NULL so the backfill sweep retries it.
-            print(f"[new]  {ip:<40}  WHOIS lookup failed — will retry", flush=True)
+            log(f"[new]  {ip:<40}  WHOIS lookup failed — will retry")
         else:
-            print(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}", flush=True)
+            log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}")
 
     conn.commit()
 
@@ -97,7 +103,7 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
     if not rows:
         return
 
-    print(f"[backfill] retrying {len(rows)} IP(s) with previously failed lookups", flush=True)
+    log(f"[backfill] retrying {len(rows)} IP(s) with previously failed lookups")
     for (ip,) in rows:
         network, country = whois_lookup(ip)
         if network is not None:
@@ -106,7 +112,7 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
                 (network, country, ip),
             )
             conn.commit()
-            print(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}", flush=True)
+            log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}")
         time.sleep(delay)  # throttle to stay under RDAP rate limits
 
 
@@ -157,7 +163,7 @@ def tail(path: str):
                 fh.close()
                 fh    = open(path)
                 inode = new_inode
-                print(f"[info] log rotated, reopened {path}", flush=True)
+                log(f"[info] log rotated, reopened {path}")
     finally:
         fh.close()
 
@@ -177,7 +183,8 @@ def main() -> None:
     init_db(conn)
 
     def _shutdown(sig, _frame):
-        print("\n[info] shutting down", flush=True)
+        print(flush=True)  # break the ^C line before the timestamped message
+        log("[info] shutting down")
         conn.close()
         sys.exit(0)
 
@@ -185,9 +192,9 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     if IGNORE_IPS:
-        print(f"[info] ignoring {len(IGNORE_IPS)} IP(s): {', '.join(sorted(IGNORE_IPS))}", flush=True)
-    print(f"[info] watching {log_path}  →  {db_path}", flush=True)
-    print(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/lookup)", flush=True)
+        log(f"[info] ignoring {len(IGNORE_IPS)} IP(s): {', '.join(sorted(IGNORE_IPS))}")
+    log(f"[info] watching {log_path}  →  {db_path}")
+    log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/lookup)")
 
     last_backfill = time.monotonic()
     for line in tail(log_path):
