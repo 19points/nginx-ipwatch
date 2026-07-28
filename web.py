@@ -10,6 +10,7 @@ Environment variables:
 
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, g, render_template, request
 
@@ -18,6 +19,47 @@ app = Flask(__name__)
 DB_PATH = os.environ.get("DB_PATH", "/data/nginx_ips.db")
 PER_PAGE = 50
 SORT_COLS = {"ip", "network", "country", "requests", "last_seen"}
+
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+# Activity-window options (query key -> human label). Filters rows by last_seen,
+# so it surfaces IPs/networks *active* within the window; the request counts
+# shown remain all-time cumulative (the DB stores no per-request history).
+PERIODS = {
+    "all":       "All time",
+    "1h":        "Last hour",
+    "3h":        "Last 3 hours",
+    "6h":        "Last 6 hours",
+    "12h":       "Last 12 hours",
+    "24h":       "Last 24 hours",
+    "today":     "Today (UTC)",
+    "yesterday": "Yesterday (UTC)",
+    "7d":        "Last 7 days",
+}
+_PERIOD_HOURS = {"1h": 1, "3h": 3, "6h": 6, "12h": 12, "24h": 24, "7d": 24 * 7}
+
+
+def period_bounds(period: str) -> tuple[list, list]:
+    """SQL conditions restricting last_seen to *period*.
+
+    Timestamps are stored as UTC strings in TS_FMT, which sort
+    lexicographically, so plain string comparison is a valid range filter.
+    Returns ([], []) for 'all' or any unknown key.
+    """
+    now = datetime.now(timezone.utc)
+    if period in _PERIOD_HOURS:
+        cutoff = (now - timedelta(hours=_PERIOD_HOURS[period])).strftime(TS_FMT)
+        return ["last_seen >= ?"], [cutoff]
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return ["last_seen >= ?"], [start.strftime(TS_FMT)]
+    if period == "yesterday":
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=1)
+        return ["last_seen >= ? AND last_seen < ?"], [
+            start.strftime(TS_FMT), end.strftime(TS_FMT)
+        ]
+    return [], []
 
 # Network view sorts against aggregate aliases, so map the requested key to the
 # safe column/alias it may be interpolated into the ORDER BY as.
@@ -66,14 +108,18 @@ def index():
     search_ip = request.args.get("ip", "").strip()
     country   = request.args.get("country", "").strip()
     network   = request.args.get("network", "").strip()
+    period    = request.args.get("period", "all")
     sort      = request.args.get("sort", "requests")
     order     = request.args.get("order", "desc")
     page      = max(1, int(request.args.get("page", 1) or 1))
 
-    sort  = sort  if sort  in SORT_COLS else "requests"
-    order = "DESC" if order != "asc" else "ASC"
+    period = period if period in PERIODS else "all"
+    sort   = sort   if sort   in SORT_COLS else "requests"
+    order  = "DESC" if order != "asc" else "ASC"
 
-    conditions, params = [], []
+    period_conds, period_params = period_bounds(period)
+
+    conditions, params = list(period_conds), list(period_params)
     if search_ip:
         conditions.append("ip LIKE ?")
         params.append(f"%{search_ip}%")
@@ -105,11 +151,15 @@ def index():
         ).fetchall()
     ]
 
+    # Stats reflect the selected period (but not the ip/country/network
+    # filters), giving a summary of activity within the window.
+    pwhere = f"WHERE {' AND '.join(period_conds)}" if period_conds else ""
     stats = db.execute(
         "SELECT COUNT(*) AS total_ips, "
         "COALESCE(SUM(requests), 0) AS total_requests, "
         "COUNT(DISTINCT country) AS total_countries "
-        "FROM ip_access"
+        f"FROM ip_access {pwhere}",
+        period_params,
     ).fetchone()
 
     return render_template(
@@ -118,6 +168,8 @@ def index():
         rows=rows,
         countries=countries,
         stats=stats,
+        periods=PERIODS,
+        period=period,
         search_ip=search_ip,
         sel_country=country,
         network=network,
@@ -142,15 +194,19 @@ def networks():
 
     search_net = request.args.get("network", "").strip()
     country    = request.args.get("country", "").strip()
+    period     = request.args.get("period", "all")
     sort       = request.args.get("sort", "ip_count")
     order      = request.args.get("order", "desc")
     page       = max(1, int(request.args.get("page", 1) or 1))
 
+    period   = period if period in PERIODS else "all"
     sort_sql = NET_SORT_COLS.get(sort, "ip_count")
     sort     = sort if sort in NET_SORT_COLS else "ip_count"
     order    = "DESC" if order != "asc" else "ASC"
 
-    conditions, params = [], []
+    period_conds, period_params = period_bounds(period)
+
+    conditions, params = list(period_conds), list(period_params)
     if search_net:
         conditions.append("network LIKE ?")
         params.append(f"%{search_net}%")
@@ -185,11 +241,14 @@ def networks():
         ).fetchall()
     ]
 
+    # Stats reflect the selected period (but not the network/country filters).
+    pwhere = f"WHERE {' AND '.join(period_conds)}" if period_conds else ""
     stats = db.execute(
         "SELECT COUNT(DISTINCT network) AS total_networks, "
         "COUNT(*) AS total_ips, "
         "COALESCE(SUM(requests), 0) AS total_requests "
-        "FROM ip_access"
+        f"FROM ip_access {pwhere}",
+        period_params,
     ).fetchone()
 
     return render_template(
@@ -198,6 +257,8 @@ def networks():
         rows=rows,
         countries=countries,
         stats=stats,
+        periods=PERIODS,
+        period=period,
         search_net=search_net,
         sel_country=country,
         sort=sort,

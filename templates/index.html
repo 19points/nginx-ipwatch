@@ -29,6 +29,12 @@
     {% endfor %}
   </select>
 
+  <select name="period">
+    {% for key, label in periods.items() %}
+    <option value="{{ key }}"{% if key == period %} selected{% endif %}>{{ label }}</option>
+    {% endfor %}
+  </select>
+
   <select name="sort">
     <option value="requests"  {% if sort == 'requests'  %}selected{% endif %}>Sort: Requests</option>
     <option value="last_seen" {% if sort == 'last_seen' %}selected{% endif %}>Sort: Last Seen</option>
@@ -47,19 +53,25 @@
 </form>
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) %}
+{% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&period=' ~ period %}
 <div class="result-meta">
   {% if total == 0 %}
     No results{% if search_ip or sel_country or network %} for current filters{% endif %}.
   {% else %}
     Showing {{ (page - 1) * per_page + 1 }}–{{ [(page - 1) * per_page + rows|length, total]|min }}
     of {{ '{:,}'.format(total) }} IP{% if total != 1 %}s{% endif %}
-    {% if search_ip or sel_country or network %}(filtered){% endif %}
+    {% if search_ip or sel_country or network or period != 'all' %}(filtered){% endif %}
+  {% endif %}
+  {% if period != 'all' %}
+    <span class="filter-chip">
+      active {{ periods[period] | lower }}
+      <a href="/?{{ 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) }}&period=all&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear period filter">✕</a>
+    </span>
   {% endif %}
   {% if network %}
     <span class="filter-chip">
       network <code>{{ network }}</code>
-      <a href="/?ip={{ search_ip }}&country={{ sel_country }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear network filter">✕</a>
+      <a href="/?ip={{ search_ip }}&country={{ sel_country }}&period={{ period }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear network filter">✕</a>
     </span>
   {% endif %}
 </div>
@@ -103,7 +115,7 @@
       <td>
         {% if row['country'] %}
           {% set is_private = row['country'] == 'private' %}
-          <a href="/?country={{ row['country'] }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
+          <a href="/?country={{ row['country'] }}&period={{ period }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
              class="badge{{ ' badge-private' if is_private else '' }}">{{ row['country'] }}</a>
         {% else %}
           <span style="color:#aaa">—</span>
