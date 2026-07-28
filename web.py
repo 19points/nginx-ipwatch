@@ -44,7 +44,8 @@ def get_db() -> sqlite3.Connection:
             g.db.execute("""
                 CREATE TABLE ip_access (
                     ip TEXT, network TEXT, country TEXT,
-                    requests INTEGER, last_seen TEXT
+                    requests INTEGER, last_seen TEXT,
+                    whois_attempts INTEGER, whois_next_retry TEXT
                 )
             """)
         g.db.row_factory = sqlite3.Row
