@@ -6,13 +6,66 @@ Kept in its own module so `nginx-ipwatch.py` (the writer) and `backfill.py`
 hyphen and cannot be imported, so the shared logic lives here instead.
 """
 
+import ipaddress
 import os
 import random
 import sys
 from datetime import datetime, timedelta, timezone
 
 from ipwhois import IPWhois
-from ipwhois.exceptions import IPDefinedError
+from ipwhois.exceptions import HTTPRateLimitError, IPDefinedError
+
+# ---------------------------------------------------------------------------
+# Network cache — shared by the watcher and backfill.py so both avoid redundant
+# WHOIS. Under a scanner flood there are thousands of IPs but few networks, and
+# one RDAP lookup returns the whole CIDR: resolve the first IP of a block live,
+# then serve every sibling from here with no further lookup. Each process has
+# its own module instance (and thus its own cache), primed from the DB.
+_net_cache: list = []          # newest-first list of (ip_network, cidr_str, country)
+_net_cache_seen: set = set()   # cidr strings already cached (dedup)
+
+
+def cache_add(cidr: str, country: str) -> None:
+    """Add a resolved CIDR to the in-memory cache (idempotent, newest-first)."""
+    if not cidr or cidr in _net_cache_seen:
+        return
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return
+    _net_cache_seen.add(cidr)
+    _net_cache.insert(0, (net, cidr, country))  # floods reuse recent blocks → hit early
+
+
+def cache_lookup(ip: str):
+    """Return (cidr, country) if *ip* falls inside an already-resolved network, else None."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    for net, cidr, country in _net_cache:
+        if addr in net:
+            return cidr, country
+    return None
+
+
+def prime_cache(conn) -> int:
+    """Seed the cache from networks already resolved in the DB (survives restarts)."""
+    rows = conn.execute(
+        "SELECT DISTINCT network, country FROM ip_access "
+        "WHERE network IS NOT NULL AND network != '' AND network != 'private'"
+    ).fetchall()
+    for cidr, country in rows:
+        cache_add(cidr, country)
+    return len(_net_cache)
+
+
+def is_private(ip: str) -> bool:
+    """True for RFC-1918 / loopback / link-local etc. — no public WHOIS to fetch."""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
 
 # Backoff schedule for rows whose lookup failed (network IS NULL). Shared by the
 # watcher's periodic sweep and the manual backfill tool so a failed IP's
@@ -59,6 +112,10 @@ def whois_lookup(ip: str) -> tuple[str | None, str | None]:
     except IPDefinedError:
         # RFC-1918 / loopback / link-local — not an error, just no public WHOIS.
         return "private", "private"
+    except HTTPRateLimitError as exc:
+        # Explicit 429 — surfaced distinctly so a real block is obvious in logs.
+        print(f"[whois rate-limit {ip}] {exc}", file=sys.stderr, flush=True)
+        return None, None
     except Exception as exc:
         print(f"[whois error {ip}] {exc}", file=sys.stderr, flush=True)
         return None, None

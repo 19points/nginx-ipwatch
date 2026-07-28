@@ -21,7 +21,14 @@ import sqlite3
 import signal
 from datetime import datetime, timezone
 
-from whois_util import next_retry_after, whois_lookup
+from whois_util import (
+    cache_add,
+    cache_lookup,
+    is_private,
+    next_retry_after,
+    prime_cache,
+    whois_lookup,
+)
 
 DEFAULT_LOG = "/logs/access.log"
 DEFAULT_DB  = "/data/nginx_ips.db"
@@ -37,17 +44,18 @@ IGNORE_IPS: set[str] = {
 # transient rate-limit/timeout would leave a row blank forever.
 BACKFILL_INTERVAL = int(os.environ.get("BACKFILL_INTERVAL", "900"))   # seconds between sweeps
 BACKFILL_BATCH    = int(os.environ.get("BACKFILL_BATCH", "25"))       # max rows retried per sweep
-WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "1.0"))       # seconds between lookups (rate-limit friendly)
+WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "2.0"))       # seconds between *live* lookups (rate-limit friendly)
 
 # Circuit breaker: RDAP registries temp-block a client that keeps hitting them
-# while rate-limited. If this many lookups fail in a row we assume we're blocked,
-# stop the sweep, and pause ALL WHOIS (sweep + inline) for the cooldown so the
-# block can lift instead of being kept alive.
+# while rate-limited. If this many live lookups fail in a row we assume we're
+# blocked, stop the sweep, and pause it for the cooldown so the block can lift
+# instead of being kept alive. New IPs never trigger an inline lookup (they are
+# resolved from the network cache or deferred), so only the sweep is gated.
 RATE_LIMIT_STREAK   = int(os.environ.get("RATE_LIMIT_STREAK", "3"))     # consecutive fails that trip the breaker
-RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "3600"))  # seconds to pause WHOIS after tripping
+RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "3600"))  # seconds to pause the sweep after tripping
 
-# monotonic deadline until which WHOIS is paused (0 = not paused). Single-threaded
-# process, so a module global is enough to share state across the loop and upsert().
+# monotonic deadline until which the sweep is paused (0 = not paused). Single-
+# threaded process, so a module global is enough to share state with the loop.
 _whois_paused_until = 0.0
 
 
@@ -108,22 +116,26 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
             (now, ip),
         )
     else:
-        # While rate-limited, don't fire a doomed inline lookup — insert NULL and
-        # let the backfill sweep resolve it once the cooldown lifts.
-        network, country = (None, None) if _whois_paused() else whois_lookup(ip)
+        # New IP — resolve WITHOUT a live WHOIS call whenever possible:
+        #   - private/loopback ranges have no public WHOIS (resolve locally)
+        #   - an IP inside an already-known CIDR reuses that block's data
+        # Only a genuinely new public network is deferred (network IS NULL) to the
+        # throttled backfill sweep. We never look up inline, so a flood of new IPs
+        # can't burst RDAP and trip the rate limiter.
+        if is_private(ip):
+            network, country = "private", "private"
+        else:
+            network, country = cache_lookup(ip) or (None, None)
 
         if network is None:
-            # Lookup failed (or deferred) — stored as NULL so backfill retries it.
-            attempts = 0 if _whois_paused() else 1
-            next_retry = next_retry_after(attempts) if attempts else None
+            # Deferred to the sweep. No per-IP log — a flood would drown the log;
+            # the sweep logs each IP when it resolves.
             conn.execute(
                 "INSERT INTO ip_access "
                 "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry) "
-                "VALUES (?, NULL, NULL, 1, ?, ?, ?)",
-                (ip, now, attempts, next_retry),
+                "VALUES (?, NULL, NULL, 1, ?, 0, NULL)",
+                (ip, now),
             )
-            reason = "rate-limited, deferred" if _whois_paused() else "WHOIS lookup failed"
-            log(f"[new]  {ip:<40}  {reason} — will retry")
         else:
             conn.execute(
                 "INSERT INTO ip_access "
@@ -131,7 +143,8 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
                 "VALUES (?, ?, ?, 1, ?, 0, NULL)",
                 (ip, network, country, now),
             )
-            log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}")
+            src = "private" if network == "private" else "cached"
+            log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}  ({src})")
 
     conn.commit()
 
@@ -167,15 +180,29 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
     log(f"[backfill] retrying {len(rows)} IP(s) due for a retry")
     fails = 0
     for ip, attempts in rows:
-        network, country = whois_lookup(ip)
+        # Resolve for free first (private range or inside a cached CIDR); only
+        # fall back to a live, throttled WHOIS for genuinely unknown networks.
+        if is_private(ip):
+            network, country, live = "private", "private", False
+        else:
+            hit = cache_lookup(ip)
+            if hit:
+                network, country, live = hit[0], hit[1], False
+            else:
+                network, country = whois_lookup(ip)
+                live = True
+
         if network is not None:
+            if live and network not in ("", "private"):
+                cache_add(network, country)  # first IP of a block seeds its siblings
             conn.execute(
                 "UPDATE ip_access SET network = ?, country = ?, "
                 "whois_attempts = whois_attempts + 1, whois_next_retry = NULL WHERE ip = ?",
                 (network, country, ip),
             )
             conn.commit()
-            log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}")
+            log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}"
+                f"{'' if live else '  (cached)'}")
             fails = 0
         else:
             conn.execute(
@@ -189,7 +216,8 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
                 log(f"[backfill] {fails} lookups failed in a row — assuming rate-limit/block, "
                     f"pausing WHOIS for {RATE_LIMIT_COOLDOWN}s")
                 return
-        time.sleep(delay)  # throttle to stay under RDAP rate limits
+        if live:
+            time.sleep(delay)  # throttle only real network calls; cache hits are free
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +285,7 @@ def main() -> None:
 
     conn = sqlite3.connect(db_path)
     init_db(conn)
+    cached = prime_cache(conn)
 
     def _shutdown(sig, _frame):
         print(flush=True)  # break the ^C line before the timestamped message
@@ -270,7 +299,8 @@ def main() -> None:
     if IGNORE_IPS:
         log(f"[info] ignoring {len(IGNORE_IPS)} IP(s): {', '.join(sorted(IGNORE_IPS))}")
     log(f"[info] watching {log_path}  →  {db_path}")
-    log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/lookup)")
+    log(f"[info] network cache primed with {cached} CIDR(s)")
+    log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/live lookup)")
 
     last_backfill = time.monotonic()
     for line in tail(log_path):
