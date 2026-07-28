@@ -35,6 +35,10 @@
     {% endfor %}
   </select>
 
+  {% if xip %}<input type="hidden" name="xip" value="{{ xip }}">{% endif %}
+  <input type="text" class="ex" name="xnet"     placeholder="Exclude networks…"          value="{{ xnet }}"     autocomplete="off">
+  <input type="text" class="ex" name="xcountry" placeholder="Exclude countries (US,DE)…" value="{{ xcountry }}" autocomplete="off">
+
   <select name="sort">
     <option value="ip_count"  {% if sort == 'ip_count'  %}selected{% endif %}>Sort: IPs</option>
     <option value="requests"  {% if sort == 'requests'  %}selected{% endif %}>Sort: Requests</option>
@@ -53,21 +57,24 @@
 </form>
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&period=' ~ period %}
+{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
 <div class="result-meta">
   {% if total == 0 %}
     No results{% if search_net or sel_country %} for current filters{% endif %}.
   {% else %}
     Showing {{ (page - 1) * per_page + 1 }}–{{ [(page - 1) * per_page + rows|length, total]|min }}
     of {{ '{:,}'.format(total) }} network{% if total != 1 %}s{% endif %}
-    {% if search_net or sel_country or period != 'all' %}(filtered){% endif %}
+    {% if search_net or sel_country or period != 'all' or xip or xnet or xcountry %}(filtered){% endif %}
   {% endif %}
   {% if period != 'all' %}
     <span class="filter-chip">
       active {{ periods[period] | lower }}
-      <a href="/networks?{{ 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country }}&period=all&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear period filter">✕</a>
+      <a href="/networks?{{ 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) }}&period=all&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear period filter">✕</a>
     </span>
   {% endif %}
+  {% for xlabel, xval in [('excl. IP', xip), ('excl. net', xnet), ('excl. country', xcountry)] if xval %}
+    <span class="filter-chip">{{ xlabel }} <code>{{ xval }}</code></span>
+  {% endfor %}
 </div>
 
 <!-- ── Table ──────────────────────────────────────────────── -->
