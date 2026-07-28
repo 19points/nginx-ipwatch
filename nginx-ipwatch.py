@@ -21,7 +21,7 @@ import sqlite3
 import signal
 from datetime import datetime, timezone
 
-from whois_util import whois_lookup
+from whois_util import next_retry_after, whois_lookup
 
 DEFAULT_LOG = "/logs/access.log"
 DEFAULT_DB  = "/data/nginx_ips.db"
@@ -39,6 +39,26 @@ BACKFILL_INTERVAL = int(os.environ.get("BACKFILL_INTERVAL", "900"))   # seconds 
 BACKFILL_BATCH    = int(os.environ.get("BACKFILL_BATCH", "25"))       # max rows retried per sweep
 WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "1.0"))       # seconds between lookups (rate-limit friendly)
 
+# Circuit breaker: RDAP registries temp-block a client that keeps hitting them
+# while rate-limited. If this many lookups fail in a row we assume we're blocked,
+# stop the sweep, and pause ALL WHOIS (sweep + inline) for the cooldown so the
+# block can lift instead of being kept alive.
+RATE_LIMIT_STREAK   = int(os.environ.get("RATE_LIMIT_STREAK", "3"))     # consecutive fails that trip the breaker
+RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "3600"))  # seconds to pause WHOIS after tripping
+
+# monotonic deadline until which WHOIS is paused (0 = not paused). Single-threaded
+# process, so a module global is enough to share state across the loop and upsert().
+_whois_paused_until = 0.0
+
+
+def _whois_paused() -> bool:
+    return time.monotonic() < _whois_paused_until
+
+
+def _trip_breaker() -> None:
+    global _whois_paused_until
+    _whois_paused_until = time.monotonic() + RATE_LIMIT_COOLDOWN
+
 
 def log(msg: str) -> None:
     """Print *msg* to stdout prefixed with a UTC timestamp (same format as last_seen)."""
@@ -53,14 +73,27 @@ def log(msg: str) -> None:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS ip_access (
-            ip        TEXT PRIMARY KEY,
-            network   TEXT,
-            country   TEXT,
-            requests  INTEGER NOT NULL DEFAULT 1,
-            last_seen TEXT NOT NULL
+            ip               TEXT PRIMARY KEY,
+            network          TEXT,
+            country          TEXT,
+            requests         INTEGER NOT NULL DEFAULT 1,
+            last_seen        TEXT NOT NULL,
+            whois_attempts   INTEGER NOT NULL DEFAULT 0,
+            whois_next_retry TEXT
         )
     """)
+    # Migrate DBs created before the retry-bookkeeping columns existed.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(ip_access)")}
+    if "whois_attempts" not in cols:
+        conn.execute("ALTER TABLE ip_access ADD COLUMN whois_attempts INTEGER NOT NULL DEFAULT 0")
+    if "whois_next_retry" not in cols:
+        conn.execute("ALTER TABLE ip_access ADD COLUMN whois_next_retry TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_last_seen ON ip_access (last_seen)")
+    # Partial index over just the failed rows the backfill sweep scans.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whois_retry "
+        "ON ip_access (whois_next_retry) WHERE network IS NULL"
+    )
     conn.commit()
 
 
@@ -75,44 +108,87 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
             (now, ip),
         )
     else:
-        network, country = whois_lookup(ip)
-        conn.execute(
-            "INSERT INTO ip_access (ip, network, country, requests, last_seen) "
-            "VALUES (?, ?, ?, 1, ?)",
-            (ip, network, country, now),
-        )
+        # While rate-limited, don't fire a doomed inline lookup — insert NULL and
+        # let the backfill sweep resolve it once the cooldown lifts.
+        network, country = (None, None) if _whois_paused() else whois_lookup(ip)
+
         if network is None:
-            # Lookup failed — stored as NULL so the backfill sweep retries it.
-            log(f"[new]  {ip:<40}  WHOIS lookup failed — will retry")
+            # Lookup failed (or deferred) — stored as NULL so backfill retries it.
+            attempts = 0 if _whois_paused() else 1
+            next_retry = next_retry_after(attempts) if attempts else None
+            conn.execute(
+                "INSERT INTO ip_access "
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry) "
+                "VALUES (?, NULL, NULL, 1, ?, ?, ?)",
+                (ip, now, attempts, next_retry),
+            )
+            reason = "rate-limited, deferred" if _whois_paused() else "WHOIS lookup failed"
+            log(f"[new]  {ip:<40}  {reason} — will retry")
         else:
+            conn.execute(
+                "INSERT INTO ip_access "
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry) "
+                "VALUES (?, ?, ?, 1, ?, 0, NULL)",
+                (ip, network, country, now),
+            )
             log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}")
 
     conn.commit()
 
 
 def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
-    """Retry WHOIS for up to *limit* rows whose lookup previously failed.
+    """Retry WHOIS for up to *limit* failed rows that are due for a retry.
 
-    Only touches rows where network IS NULL (a failed lookup). Rows with a
+    Only touches rows where network IS NULL (a failed lookup) AND whose
+    whois_next_retry is due (NULL = never attempted, or in the past). Rows with a
     successful-but-empty result ('') are left alone so genuinely data-less IPs
-    aren't retried forever. Rows that fail again stay NULL for the next sweep.
+    aren't retried forever.
+
+    Each failure pushes the row's whois_next_retry further out (exponential
+    backoff), so a row that keeps failing rotates to the back of the queue and
+    the sweep advances to other due rows instead of head-banging the same batch.
+
+    If RATE_LIMIT_STREAK lookups fail in a row we assume we've been rate-limited
+    or temp-blocked, trip the breaker (pausing all WHOIS for a cooldown), and
+    abort the sweep rather than deepening the block.
     """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     rows = conn.execute(
-        "SELECT ip FROM ip_access WHERE network IS NULL LIMIT ?", (limit,)
+        "SELECT ip, whois_attempts FROM ip_access "
+        "WHERE network IS NULL AND (whois_next_retry IS NULL OR whois_next_retry <= ?) "
+        # never-attempted rows (NULL) first, then the soonest-due
+        "ORDER BY whois_next_retry IS NOT NULL, whois_next_retry "
+        "LIMIT ?",
+        (now, limit),
     ).fetchall()
     if not rows:
         return
 
-    log(f"[backfill] retrying {len(rows)} IP(s) with previously failed lookups")
-    for (ip,) in rows:
+    log(f"[backfill] retrying {len(rows)} IP(s) due for a retry")
+    fails = 0
+    for ip, attempts in rows:
         network, country = whois_lookup(ip)
         if network is not None:
             conn.execute(
-                "UPDATE ip_access SET network = ?, country = ? WHERE ip = ?",
+                "UPDATE ip_access SET network = ?, country = ?, "
+                "whois_attempts = whois_attempts + 1, whois_next_retry = NULL WHERE ip = ?",
                 (network, country, ip),
             )
             conn.commit()
             log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}")
+            fails = 0
+        else:
+            conn.execute(
+                "UPDATE ip_access SET whois_attempts = ?, whois_next_retry = ? WHERE ip = ?",
+                (attempts + 1, next_retry_after(attempts + 1), ip),
+            )
+            conn.commit()
+            fails += 1
+            if fails >= RATE_LIMIT_STREAK:
+                _trip_breaker()
+                log(f"[backfill] {fails} lookups failed in a row — assuming rate-limit/block, "
+                    f"pausing WHOIS for {RATE_LIMIT_COOLDOWN}s")
+                return
         time.sleep(delay)  # throttle to stay under RDAP rate limits
 
 
@@ -198,7 +274,7 @@ def main() -> None:
 
     last_backfill = time.monotonic()
     for line in tail(log_path):
-        if time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
+        if not _whois_paused() and time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
             backfill(conn, BACKFILL_BATCH, WHOIS_DELAY)
             last_backfill = time.monotonic()
 

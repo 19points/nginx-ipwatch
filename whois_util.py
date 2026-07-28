@@ -6,10 +6,32 @@ Kept in its own module so `nginx-ipwatch.py` (the writer) and `backfill.py`
 hyphen and cannot be imported, so the shared logic lives here instead.
 """
 
+import os
+import random
 import sys
+from datetime import datetime, timedelta, timezone
 
 from ipwhois import IPWhois
 from ipwhois.exceptions import IPDefinedError
+
+# Backoff schedule for rows whose lookup failed (network IS NULL). Shared by the
+# watcher's periodic sweep and the manual backfill tool so a failed IP's
+# whois_next_retry is computed identically wherever it is written.
+RETRY_BASE = int(os.environ.get("WHOIS_RETRY_BASE", "900"))    # 1st retry ~this many seconds out
+RETRY_MAX  = int(os.environ.get("WHOIS_RETRY_MAX", "86400"))   # cap the exponential growth (24h)
+
+
+def next_retry_after(attempts: int) -> str:
+    """UTC timestamp (same format as last_seen) for a row's next WHOIS retry.
+
+    Exponential backoff on the failure count with ±25% jitter, so an IP that
+    keeps failing is retried ever less often and a large backlog doesn't retry
+    in lockstep. *attempts* is the post-increment failure count (>= 1).
+    """
+    delay = min(RETRY_BASE * 2 ** max(0, attempts - 1), RETRY_MAX)
+    delay *= random.uniform(0.75, 1.25)
+    when = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    return when.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def whois_lookup(ip: str) -> tuple[str | None, str | None]:

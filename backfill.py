@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import time
 
-from whois_util import whois_lookup
+from whois_util import next_retry_after, whois_lookup
 
 DEFAULT_DB = "/data/nginx_ips.db"
 
@@ -50,32 +50,39 @@ def main() -> None:
     # network IS NULL  -> lookup failed (new behaviour, always retried)
     # network = ''     -> looked up but no data (legacy failures live here too)
     where = "network IS NULL" if not args.include_empty else "(network IS NULL OR network = '')"
-    query = f"SELECT ip FROM ip_access WHERE {where} ORDER BY last_seen DESC"
+    query = f"SELECT ip, whois_attempts FROM ip_access WHERE {where} ORDER BY last_seen DESC"
     if args.limit > 0:
         query += f" LIMIT {args.limit}"
 
     conn = sqlite3.connect(args.db_path, timeout=10)
     conn.execute("PRAGMA busy_timeout = 5000")
 
-    ips = [row[0] for row in conn.execute(query).fetchall()]
-    if not ips:
+    rows = conn.execute(query).fetchall()
+    if not rows:
         print("Nothing to backfill — no matching rows.")
         return
 
-    print(f"Backfilling {len(ips)} row(s) from {args.db_path} "
+    print(f"Backfilling {len(rows)} row(s) from {args.db_path} "
           f"({'NULL + empty' if args.include_empty else 'NULL only'}, {args.delay}s/lookup)")
 
     fixed = failed = unchanged = 0
-    for ip in ips:
+    for ip, attempts in rows:
         network, country = whois_lookup(ip)
         if network is None:
+            # Still failing — record the attempt and push the retry out so the
+            # watcher's backoff schedule stays coherent after a manual run.
             failed += 1
             print(f"  [fail]  {ip:<40}  still failing")
+            conn.execute(
+                "UPDATE ip_access SET whois_attempts = ?, whois_next_retry = ? WHERE ip = ?",
+                (attempts + 1, next_retry_after(attempts + 1), ip),
+            )
+            conn.commit()
         elif network == "":
             unchanged += 1
             print(f"  [empty] {ip:<40}  no WHOIS data")
             conn.execute(
-                "UPDATE ip_access SET network = ?, country = ? WHERE ip = ?",
+                "UPDATE ip_access SET network = ?, country = ?, whois_next_retry = NULL WHERE ip = ?",
                 (network, country, ip),
             )
             conn.commit()
@@ -83,7 +90,7 @@ def main() -> None:
             fixed += 1
             print(f"  [ok]    {ip:<40}  net={network:<20}  country={country or '-'}")
             conn.execute(
-                "UPDATE ip_access SET network = ?, country = ? WHERE ip = ?",
+                "UPDATE ip_access SET network = ?, country = ?, whois_next_retry = NULL WHERE ip = ?",
                 (network, country, ip),
             )
             conn.commit()
