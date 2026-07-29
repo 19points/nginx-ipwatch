@@ -27,6 +27,7 @@ import sqlite3
 import sys
 import time
 
+from geoip_util import geoip_lookup, load_geoip
 from whois_util import (
     cache_add,
     cache_lookup,
@@ -70,24 +71,31 @@ def main() -> None:
         return
 
     primed = prime_cache(conn)
+    geo_country, geo_asn = load_geoip()
     print(f"Backfilling {len(rows)} row(s) from {args.db_path} "
           f"({'NULL + empty' if args.include_empty else 'NULL only'}, {args.delay}s/live lookup, "
-          f"cache primed with {primed} CIDR(s))")
+          f"cache primed with {primed} CIDR(s), "
+          f"geoip {geo_country + geo_asn} ranges)")
 
     fixed = failed = unchanged = 0
     for ip, attempts in rows:
-        # Resolve for free first (private range or inside a cached CIDR); only a
-        # genuinely unknown public network needs a live, throttled WHOIS call.
+        # Resolve for free first (private range, cached CIDR, or offline GeoIP);
+        # only IPs none of those place need a live, throttled WHOIS call.
+        live, source = False, ""
         if is_private(ip):
-            network, country, live = "private", "private", False
+            network, country = "private", "private"
         else:
             hit = cache_lookup(ip)
             if hit:
-                network, country, live = hit[0], hit[1], False
+                network, country, source = hit[0], hit[1], "cached"
             else:
-                network, country = whois_lookup(ip)
-                live = True
-        if network is not None and live and network not in ("", "private"):
+                geo = geoip_lookup(ip)
+                if geo is not None:
+                    network, country, source = geo[0], geo[1], "geoip"
+                else:
+                    network, country = whois_lookup(ip)
+                    live = True
+        if network is not None and source != "cached" and network not in ("", "private"):
             cache_add(network, country)  # first IP of a block seeds its siblings
 
         if network is None:
@@ -110,7 +118,7 @@ def main() -> None:
             conn.commit()
         else:
             fixed += 1
-            src = "" if live else "  (cached)"
+            src = f"  ({source})" if source else ""
             print(f"  [ok]    {ip:<40}  net={network:<20}  country={country or '-'}{src}")
             conn.execute(
                 "UPDATE ip_access SET network = ?, country = ?, whois_next_retry = NULL WHERE ip = ?",
