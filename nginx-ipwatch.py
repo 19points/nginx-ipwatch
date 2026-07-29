@@ -102,6 +102,17 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_whois_retry "
         "ON ip_access (whois_next_retry) WHERE network IS NULL"
     )
+    # Heal rows poisoned by a cached default route (0.0.0.0/0 / ::/0): RDAP's
+    # catch-all matched every IP in the old cache, so these were mislabelled
+    # (often never looked up at all). Reset them to NULL so the sweep resolves
+    # them for real — the cache now refuses default routes, so no re-poisoning.
+    healed = conn.execute(
+        "UPDATE ip_access SET network = NULL, country = NULL, "
+        "whois_attempts = 0, whois_next_retry = NULL "
+        "WHERE network IN ('0.0.0.0/0', '::/0')"
+    ).rowcount
+    if healed:
+        log(f"[info] reset {healed} row(s) with a bogus 0.0.0.0/0 network for re-resolution")
     conn.commit()
 
 

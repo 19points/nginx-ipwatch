@@ -33,6 +33,12 @@ def cache_add(cidr: str, country: str) -> None:
         net = ipaddress.ip_network(cidr, strict=False)
     except ValueError:
         return
+    if net.prefixlen == 0:
+        # A default route (0.0.0.0/0 or ::/0) contains EVERY address — caching it
+        # would make every subsequent lookup a false hit. It's never a real
+        # allocation, so refuse it. (whois_lookup already strips these, but this
+        # also protects prime_cache from legacy 0.0.0.0/0 rows in an old DB.)
+        return
     _net_cache_seen.add(cidr)
     _net_cache.insert(0, (net, cidr, country))  # floods reuse recent blocks → hit early
 
@@ -87,6 +93,27 @@ def next_retry_after(attempts: int) -> str:
     return when.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _clean_cidr(cidr: str) -> str:
+    """Strip default-route (prefixlen-0) parts from an RDAP cidr string.
+
+    RDAP hands back 0.0.0.0/0 (or ::/0) as a catch-all for IPs it can't place in
+    a real allocation. That's not a network — and if stored/cached it matches
+    every IP — so drop it. Returns the remaining real CIDRs (comma-joined), or
+    '' if the result was nothing but a default route.
+    """
+    parts = []
+    for part in (p.strip() for p in cidr.split(",")):
+        if not part:
+            continue
+        try:
+            if ipaddress.ip_network(part, strict=False).prefixlen == 0:
+                continue
+        except ValueError:
+            continue
+        parts.append(part)
+    return ", ".join(parts)
+
+
 def whois_lookup(ip: str) -> tuple[str | None, str | None]:
     """Resolve *ip* to (network_cidr, country) via a single RDAP lookup.
 
@@ -105,9 +132,15 @@ def whois_lookup(ip: str) -> tuple[str | None, str | None]:
     """
     try:
         data = IPWhois(ip).lookup_rdap(depth=1)
-        net     = data.get("network") or {}
-        network = net.get("cidr") or ""
-        country = net.get("country") or data.get("asn_country_code") or ""
+        net      = data.get("network") or {}
+        raw_cidr = net.get("cidr") or ""
+        network  = _clean_cidr(raw_cidr)
+        country  = net.get("country") or data.get("asn_country_code") or ""
+        if raw_cidr and not network:
+            # RDAP returned ONLY a default route — a catch-all, not a real
+            # allocation. The country that came with it is unreliable, so drop
+            # it too rather than mislabel the IP (e.g. a bogus but valid "ID").
+            country = ""
         return network, country.upper()
     except IPDefinedError:
         # RFC-1918 / loopback / link-local — not an error, just no public WHOIS.
