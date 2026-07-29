@@ -53,6 +53,10 @@ jobs:
         with:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Unique per run (and per re-run attempt) so the GeoIP ADD layers are
+          # always re-downloaded fresh, even if build-layer caching is added later.
+          build-args: |
+            GEOIP_CACHEBUST=${{ github.run_id }}-${{ github.run_attempt }}
           # Old Docker (< 20.10, e.g. 19.03) can't pull OCI-format manifests or
           # provenance attestation image-indexes. Disable provenance and force
           # Docker schema2 media types so legacy engines can pull these images.
