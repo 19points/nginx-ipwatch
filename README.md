@@ -12,7 +12,27 @@ Tails an Nginx access log, performs WHOIS lookups on newly seen IP addresses, an
 | `requests` | Running count of requests from this IP |
 | `last_seen` | UTC timestamp of most recent request |
 
-WHOIS runs via RDAP, but only once per **network**: the first IP seen from a CIDR block is looked up and every other IP in that block reuses the cached result. This keeps RDAP request volume (and rate-limiting) down under scanner floods that hit many IPs from the same few networks. Private/RFC-1918 addresses are stored as `private` with no round-trip. Failed lookups are stored as unresolved and retried later on an interval with exponential backoff, guarded by a rate-limit circuit breaker.
+### How IPs are resolved
+
+Each new IP is resolved in this order, stopping at the first hit:
+
+1. **Private** — RFC-1918 / loopback / link-local are stored as `private` with no lookup.
+2. **Network cache** — an IP inside an already-resolved CIDR reuses that block's data.
+3. **GeoIP** — offline local databases (see below) place the vast majority of IPs *instantly*, giving both country and network with **no network call and no rate limit**.
+4. **RDAP/WHOIS** — only IPs GeoIP can't place fall through to a throttled background sweep. Failures are retried with exponential backoff, guarded by a rate-limit circuit breaker. Results feed the network cache, so one lookup resolves a whole block.
+
+Because GeoIP handles the bulk offline, live RDAP traffic (and the rate-limiting it used to cause under scanner floods) is minimal.
+
+### GeoIP databases
+
+The Docker image fetches offline databases from [sapics/ip-location-db](https://github.com/sapics/ip-location-db) at build time:
+
+- **Country** — [DB-IP Lite](https://db-ip.com) (`dbip-country-*-num.csv`), a geolocation database.
+- **Network / ASN** — [IPtoASN](https://iptoasn.com) (`iptoasn-asn-*-num.csv`, public domain); the matched range gives the network CIDR.
+
+They're pure CSV loaded in-process — no extra Python dependency. To refresh them, rebuild with `docker compose build --no-cache`. To use different sources (e.g. GeoLite2), change the `ADD` URLs in the `Dockerfile` and the `GEOIP_COUNTRY_DB` / `GEOIP_ASN_DB` env vars (each a comma-separated list of CSV paths; IPv4 and IPv6 files can both be listed). If neither var points to a readable file, GeoIP is disabled and everything falls back to RDAP.
+
+> Country data © [DB-IP](https://db-ip.com), licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). ASN data from [iptoasn.com](https://iptoasn.com) (public domain).
 
 ## Services
 
@@ -84,6 +104,20 @@ python nginx-ipwatch.py /var/log/nginx/access.log ./nginx_ips.db
 
 # web UI (terminal 2)
 DB_PATH=./nginx_ips.db gunicorn web:app --bind 0.0.0.0:5000
+```
+
+GeoIP is optional here — without it the watcher falls back to RDAP. To enable it, download the CSVs and point the env vars at them:
+
+```bash
+base=https://github.com/sapics/ip-location-db/releases/download/latest
+mkdir -p geoip && cd geoip
+for f in dbip-country-ipv4-num.csv dbip-country-ipv6-num.csv \
+         iptoasn-asn-ipv4-num.csv iptoasn-asn-ipv6-num.csv; do curl -sLO "$base/$f"; done
+cd ..
+
+GEOIP_COUNTRY_DB=geoip/dbip-country-ipv4-num.csv,geoip/dbip-country-ipv6-num.csv \
+GEOIP_ASN_DB=geoip/iptoasn-asn-ipv4-num.csv,geoip/iptoasn-asn-ipv6-num.csv \
+python nginx-ipwatch.py /var/log/nginx/access.log ./nginx_ips.db
 ```
 
 ## Querying SQLite directly

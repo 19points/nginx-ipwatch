@@ -21,6 +21,7 @@ import sqlite3
 import signal
 from datetime import datetime, timezone
 
+from geoip_util import geoip_lookup, load_geoip
 from whois_util import (
     cache_add,
     cache_lookup,
@@ -130,13 +131,24 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
         # New IP — resolve WITHOUT a live WHOIS call whenever possible:
         #   - private/loopback ranges have no public WHOIS (resolve locally)
         #   - an IP inside an already-known CIDR reuses that block's data
-        # Only a genuinely new public network is deferred (network IS NULL) to the
-        # throttled backfill sweep. We never look up inline, so a flood of new IPs
-        # can't burst RDAP and trip the rate limiter.
+        #   - the offline GeoIP tables place most public IPs instantly
+        # Only IPs GeoIP can't place are deferred (network IS NULL) to the
+        # throttled backfill sweep, where RDAP is the last resort. We never look
+        # up inline, so a flood of new IPs can't burst RDAP and trip the limiter.
+        src = None
         if is_private(ip):
-            network, country = "private", "private"
+            network, country, src = "private", "private", "private"
         else:
-            network, country = cache_lookup(ip) or (None, None)
+            hit = cache_lookup(ip)
+            if hit:
+                network, country, src = hit[0], hit[1], "cached"
+            else:
+                geo = geoip_lookup(ip)
+                if geo is not None:
+                    network, country, src = geo[0], geo[1], "geoip"
+                    cache_add(network, country)
+                else:
+                    network, country = None, None
 
         if network is None:
             # Deferred to the sweep. No per-IP log — a flood would drown the log;
@@ -154,7 +166,6 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
                 "VALUES (?, ?, ?, 1, ?, 0, NULL)",
                 (ip, network, country, now),
             )
-            src = "private" if network == "private" else "cached"
             log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}  ({src})")
 
     conn.commit()
@@ -191,20 +202,25 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
     log(f"[backfill] retrying {len(rows)} IP(s) due for a retry")
     fails = 0
     for ip, attempts in rows:
-        # Resolve for free first (private range or inside a cached CIDR); only
-        # fall back to a live, throttled WHOIS for genuinely unknown networks.
+        # Resolve for free first (private range, cached CIDR, or offline GeoIP);
+        # only fall back to a live, throttled WHOIS for IPs none of those place.
+        live, source = False, ""
         if is_private(ip):
-            network, country, live = "private", "private", False
+            network, country = "private", "private"
         else:
             hit = cache_lookup(ip)
             if hit:
-                network, country, live = hit[0], hit[1], False
+                network, country, source = hit[0], hit[1], "cached"
             else:
-                network, country = whois_lookup(ip)
-                live = True
+                geo = geoip_lookup(ip)
+                if geo is not None:
+                    network, country, source = geo[0], geo[1], "geoip"
+                else:
+                    network, country = whois_lookup(ip)
+                    live = True
 
         if network is not None:
-            if live and network not in ("", "private"):
+            if source != "cached" and network not in ("", "private"):
                 cache_add(network, country)  # first IP of a block seeds its siblings
             conn.execute(
                 "UPDATE ip_access SET network = ?, country = ?, "
@@ -213,7 +229,7 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
             )
             conn.commit()
             log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}"
-                f"{'' if live else '  (cached)'}")
+                f"{('  (' + source + ')') if source else ''}")
             fails = 0
         else:
             conn.execute(
@@ -297,6 +313,7 @@ def main() -> None:
     conn = sqlite3.connect(db_path)
     init_db(conn)
     cached = prime_cache(conn)
+    geo_country, geo_asn = load_geoip()
 
     def _shutdown(sig, _frame):
         print(flush=True)  # break the ^C line before the timestamped message
@@ -311,6 +328,10 @@ def main() -> None:
         log(f"[info] ignoring {len(IGNORE_IPS)} IP(s): {', '.join(sorted(IGNORE_IPS))}")
     log(f"[info] watching {log_path}  →  {db_path}")
     log(f"[info] network cache primed with {cached} CIDR(s)")
+    if geo_country or geo_asn:
+        log(f"[info] geoip loaded: {geo_country} country ranges, {geo_asn} asn ranges (RDAP is fallback)")
+    else:
+        log("[info] geoip disabled (no GEOIP_COUNTRY_DB/GEOIP_ASN_DB) — using RDAP")
     log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/live lookup)")
 
     last_backfill = time.monotonic()
