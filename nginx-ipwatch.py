@@ -25,6 +25,7 @@ from geoip_util import geoip_lookup, load_geoip
 from whois_util import (
     cache_add,
     cache_lookup,
+    cache_size,
     is_private,
     next_retry_after,
     prime_cache,
@@ -337,6 +338,14 @@ def main() -> None:
     last_backfill = time.monotonic()
     for line in tail(log_path):
         if not _whois_paused() and time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
+            # Re-prime first: the web UI's manual lookups write CIDRs this
+            # process has never seen. Picking them up here means a sibling IP
+            # logged later resolves from cache instead of needing its own live
+            # lookup — which matters most when the registry is blocking us.
+            before = cache_size()
+            learned = prime_cache(conn) - before
+            if learned > 0:
+                log(f"[info] learned {learned} CIDR(s) resolved elsewhere (manual lookup / other process)")
             backfill(conn, BACKFILL_BATCH, WHOIS_DELAY)
             last_backfill = time.monotonic()
 
