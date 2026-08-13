@@ -56,6 +56,28 @@
   <a href="/" class="btn btn-reset">Reset</a>
 </form>
 
+<!-- ── Manual WHOIS lookup ────────────────────────────────────
+     Separate form (can't nest inside the filters form) and a POST, because
+     unlike everything else on this page it writes to the database. -->
+<form class="lookup-bar" method="post" action="/lookup">
+  <input type="hidden" name="qs" value="{{ qs }}">
+  <strong style="color:#054A91">Manual lookup</strong>
+  <input type="text" name="ip" placeholder="IP address…" autocomplete="off" required>
+  <button type="submit" class="btn btn-lookup">Resolve &amp; store</button>
+  <span class="lookup-hint">
+    Queries a third-party WHOIS source, then fills this IP and any unresolved IPs
+    in the same network. Use when the registry has blocked automatic lookups.
+  </span>
+</form>
+
+<!-- ── Lookup result ──────────────────────────────────────── -->
+{% if lookup_msg %}
+<div class="banner {{ 'banner-ok' if lookup_ok else 'banner-err' }}">
+  <span>{{ '✓' if lookup_ok else '⚠' }}</span>
+  <span>{{ lookup_msg }}</span>
+</div>
+{% endif %}
+
 <!-- ── Result count ───────────────────────────────────────── -->
 {% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
 <div class="result-meta">
@@ -117,6 +139,13 @@
           {% endfor %}
         {% else %}
           <span style="color:#aaa">—</span>
+          <!-- No network yet: the automatic sweep either hasn't reached this IP
+               or the registry is refusing us. Offer a manual resolve. -->
+          <form class="lookup-inline" method="post" action="/lookup">
+            <input type="hidden" name="ip" value="{{ row['ip'] }}">
+            <input type="hidden" name="qs" value="{{ qs }}">
+            <button type="submit" class="btn-lookup-sm" title="Look this IP up via a third-party WHOIS source and store the result">🔍 Look up</button>
+          </form>
         {% endif %}
       </td>
       <td>

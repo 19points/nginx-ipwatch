@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
-web.py — read-only Flask UI for the nginx-ipwatch SQLite database.
+web.py — Flask UI for the nginx-ipwatch SQLite database.
+
+Browsing is read-only (the DB is opened with mode=ro). The single exception is
+the manual lookup at POST /lookup, which resolves one IP through a third-party
+source and writes the result — see proxy_util for why that's needed.
 
 Environment variables:
-    DB_PATH   path to the SQLite file  (default /data/nginx_ips.db)
-    HOST      bind address             (default 0.0.0.0)
-    PORT      bind port                (default 5000)
+    DB_PATH              path to the SQLite file  (default /data/nginx_ips.db)
+    HOST                 bind address             (default 0.0.0.0)
+    PORT                 bind port                (default 5000)
+    LOOKUP_MIN_INTERVAL  min seconds between manual lookups (default 2.0)
 """
 
+import ipaddress
 import os
 import sqlite3
+import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, g, render_template, request
+from flask import Flask, g, redirect, render_template, request
+
+import proxy_util
 
 app = Flask(__name__)
 
@@ -146,6 +156,213 @@ def close_db(_exc):
     db = g.pop("db", None)
     if db:
         db.close()
+    rw = g.pop("db_rw", None)
+    if rw:
+        rw.close()
+
+
+def get_db_rw() -> sqlite3.Connection:
+    """Writable connection, opened only for the manual-lookup route.
+
+    Deliberately separate from get_db()'s mode=ro handle so every other view
+    keeps its read-only guarantee. The watcher holds the same file, so a
+    busy_timeout covers the moment both want the write lock.
+    """
+    if "db_rw" not in g:
+        conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        g.db_rw = conn
+    return g.db_rw
+
+
+# ---------------------------------------------------------------------------
+# Manual lookup
+# ---------------------------------------------------------------------------
+
+# One live lookup per this many seconds, so a held-down button can't turn the UI
+# into the abusive querying that got the host banned in the first place. The
+# limiter is per worker process (gunicorn runs several), which is fine for a
+# human-triggered action — it's a guard against accidents, not an access control.
+LOOKUP_MIN_INTERVAL = float(os.environ.get("LOOKUP_MIN_INTERVAL", "2.0"))
+_last_lookup = 0.0
+
+# SQLite caps host parameters per statement; chunk sibling updates well under it.
+_UPDATE_CHUNK = 500
+
+
+def _rows_for_address(conn, ip: str) -> list:
+    """The DB's spelling(s) of *ip* — whatever text form the log recorded.
+
+    An IPv6 address has many valid text forms and nginx logs whichever the client
+    presented, so the table can hold '2a02:6b8::feed:0ff' while ipaddress
+    canonicalises the same address to '2a02:6b8::feed:ff'. A plain `ip = ?` then
+    silently misses the row it was meant to update. IPv4 has one form in
+    practice, so only v6 needs the rescan — and only v6 rows (the ones with a
+    colon) are candidates, which keeps it a narrow scan rather than a full one.
+    """
+    hit = [r[0] for r in conn.execute("SELECT ip FROM ip_access WHERE ip = ?", (ip,))]
+    if hit:
+        return hit
+    try:
+        target = ipaddress.ip_address(ip)
+    except ValueError:
+        return []
+    if target.version != 6:
+        return []
+    matches = []
+    for (candidate,) in conn.execute("SELECT ip FROM ip_access WHERE ip LIKE '%:%'"):
+        try:
+            if ipaddress.ip_address(candidate) == target:
+                matches.append(candidate)
+        except ValueError:
+            continue
+    return matches
+
+
+def _siblings_in(conn, block, exclude: set) -> list:
+    """Unresolved IPs (network IS NULL) inside *block*, minus those in *exclude*.
+
+    CIDR containment isn't something SQLite can express, so the candidate set is
+    the whole unresolved backlog and the filtering happens here. That set is
+    bounded by how far behind the WHOIS sweep is, and this runs once per manual
+    click, so a linear pass is fine.
+    """
+    found = []
+    for (ip,) in conn.execute("SELECT ip FROM ip_access WHERE network IS NULL"):
+        if ip in exclude:
+            continue
+        try:
+            if ipaddress.ip_address(ip) in block:
+                found.append(ip)
+        except ValueError:
+            continue
+    return found
+
+
+def apply_lookup(conn, result) -> tuple[int, int]:
+    """Persist *result*, returning (rows for the queried IP, sibling rows filled).
+
+    The queried IP is overwritten unconditionally — asking for it explicitly is a
+    statement that the manual answer beats whatever GeoIP guessed. Siblings are
+    only *filled in*, never overwritten, so one click can't silently rewrite
+    blocks of data the user didn't ask about.
+
+    A result carrying a country but no network updates the country and leaves
+    network NULL, so the watcher's sweep still gets a chance to resolve the CIDR
+    later instead of the row looking permanently answered.
+    """
+    network = result.network or None
+    country = result.country or None
+
+    own = _rows_for_address(conn, result.ip)
+    queried = 0
+    if own:
+        placeholders = ",".join("?" * len(own))
+        queried = conn.execute(
+            f"UPDATE ip_access SET network = COALESCE(?, network), "
+            f"country = COALESCE(?, country), whois_next_retry = NULL "
+            f"WHERE ip IN ({placeholders})",
+            [network, country] + own,
+        ).rowcount
+
+    filled = 0
+    if network:
+        try:
+            block = ipaddress.ip_network(network, strict=False)
+        except ValueError:
+            block = None
+        if block is not None and block.prefixlen > 0:
+            # Exclude the queried row(s) — already updated above, and counting
+            # them again would double-report them in the UI.
+            targets = _siblings_in(conn, block, set(own))
+            for i in range(0, len(targets), _UPDATE_CHUNK):
+                chunk = targets[i:i + _UPDATE_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                conn.execute(
+                    f"UPDATE ip_access SET network = ?, country = ?, "
+                    f"whois_next_retry = NULL WHERE network IS NULL "
+                    f"AND ip IN ({placeholders})",
+                    [network, country or ""] + chunk,
+                )
+            filled = len(targets)
+
+    conn.commit()
+    return queried, filled
+
+
+def _back_to(qs: str, **extra) -> str:
+    """Redirect target: the filters the user came from, plus lookup feedback.
+
+    *qs* is echoed back from a form field, so it is re-parsed and re-encoded
+    rather than concatenated — and only ever appended to our own '/' path, so it
+    can't be turned into an open redirect. Stale lu_* keys are dropped so
+    repeated lookups don't stack up feedback params.
+    """
+    pairs = [(k, v) for k, v in urllib.parse.parse_qsl(qs, keep_blank_values=True)
+             if not k.startswith("lu_")]
+    pairs += [(k, v) for k, v in extra.items() if v not in (None, "")]
+    return ("/?" + urllib.parse.urlencode(pairs)) if pairs else "/"
+
+
+@app.route("/lookup", methods=["POST"])
+def manual_lookup():
+    """Resolve one IP through a third-party source and store the result.
+
+    Exists because a registry can permanently ban a host from its query service
+    (RIPE ERROR:201), after which the watcher's automatic RDAP path fails for
+    every IP even though the data is public. See proxy_util.
+    """
+    global _last_lookup
+
+    qs = request.form.get("qs", "")
+    raw = (request.form.get("ip") or "").strip()
+
+    try:
+        ip = str(ipaddress.ip_address(raw))
+    except ValueError:
+        return redirect(_back_to(qs, lu_ip=raw[:64], lu_msg="Not a valid IP address."), 303)
+
+    if ipaddress.ip_address(ip).is_private:
+        return redirect(_back_to(
+            qs, lu_ip=ip, lu_msg="Private/loopback address — no public registry data exists."
+        ), 303)
+
+    wait = LOOKUP_MIN_INTERVAL - (time.monotonic() - _last_lookup)
+    if wait > 0:
+        return redirect(_back_to(
+            qs, lu_ip=ip, lu_msg=f"Slow down — try again in {wait:.0f}s."
+        ), 303)
+    _last_lookup = time.monotonic()
+
+    result, tried = proxy_util.lookup(ip)
+    if result is None:
+        return redirect(_back_to(
+            qs, lu_ip=ip, lu_msg=f"No data returned by {', '.join(tried)}."
+        ), 303)
+
+    try:
+        queried, filled = apply_lookup(get_db_rw(), result)
+    except sqlite3.Error as exc:
+        return redirect(_back_to(qs, lu_ip=ip, lu_msg=f"Database write failed: {exc}"), 303)
+
+    parts = [f"{result.network or '—'}", f"{result.country or '—'}"]
+    if result.netname:
+        parts.append(result.netname)
+    if result.asn:
+        parts.append(f"AS{result.asn}")
+    detail = " · ".join(parts)
+
+    if queried:
+        msg = f"{ip} → {detail} (via {result.source})."
+    else:
+        # Looking up an IP the log has never seen is allowed — it's a useful way
+        # to check a block — but nothing is inserted: this table is a record of
+        # observed traffic, not a WHOIS cache.
+        msg = f"{ip} → {detail} (via {result.source}). Not in the database, so nothing was stored."
+    if filled:
+        msg += f" Filled {filled} unresolved IP{'s' if filled != 1 else ''} in {result.network}."
+
+    return redirect(_back_to(qs, lu_ip=ip, lu_ok="1", lu_msg=msg), 303)
 
 
 @app.route("/")
@@ -224,6 +441,12 @@ def index():
         stats=stats,
         periods=PERIODS,
         period=period,
+        # Feedback from a POST /lookup redirect, plus the current filters so the
+        # lookup forms can send the user back to exactly this view.
+        lookup_msg=request.args.get("lu_msg", "")[:400],
+        lookup_ok=request.args.get("lu_ok") == "1",
+        lookup_ip=request.args.get("lu_ip", "")[:64],
+        qs=request.query_string.decode("utf-8", "replace"),
         search_ip=search_ip,
         sel_country=country,
         network=network,

@@ -23,6 +23,51 @@ Each new IP is resolved in this order, stopping at the first hit:
 
 Because GeoIP handles the bulk offline, live RDAP traffic (and the rate-limiting it used to cause under scanner floods) is minimal.
 
+Anything none of the four can resolve stays `NULL` and can be resolved by hand — see [Manual lookup](#manual-lookup-when-a-registry-blocks-you).
+
+### Manual lookup (when a registry blocks you)
+
+A registry can **permanently ban** your server from querying it. RIPE does this to a host that has queried too hard, and once it lands both port-43 WHOIS and RDAP stop answering *every* lookup:
+
+```
+$ whois 78.61.136.250
+%ERROR:201: access denied for 95.216.220.179
+% Sorry, access from your host has been permanently
+% denied because of a repeated excessive querying.
+```
+
+The IPs then look unresolvable even though the data is perfectly public — it's your host that's blocked, not the data. The fix is to let somebody else make the registry query, which is what the **Manual lookup** box and the 🔍 button (shown on any row with no network) in the web UI do. Sources are tried in order:
+
+| Source | Notes |
+|--------|-------|
+| **RIPEstat** (`stat.ripe.net`) | RIPE's *data* API — a separate service from the banned query service, keyless, IPv4 + IPv6, all RIRs. Its `network-info` call returns the **BGP-announced prefix**, which is more specific than the RIR allocation RDAP reports. |
+| **whois.com** | Scrapes the raw registry text they render. Fallback only: IPv4-only, and being HTML it breaks if they restyle the page. |
+
+The more specific prefix is the reason this is worth doing even when you aren't blocked. For `78.61.136.250`, RDAP reports the registry allocation, while RIPEstat reports the routed block — a difference of 32x in how many unrelated hosts get lumped into one `/networks` row:
+
+```
+RDAP     78.61.0.0/17, 78.61.128.0/18, 78.61.192.0/21   (inetnum, ~32k addresses)
+RIPEstat 78.61.136.0/22                                 (route, AS8764 — stored)
+```
+
+A lookup writes:
+
+- the **queried IP** — overwritten unconditionally; asking for it explicitly means the manual answer beats whatever GeoIP guessed
+- every **unresolved IP in the same block** (`network IS NULL`) — filled in, so one click clears a whole CIDR from the backlog. Already-resolved rows are left alone, so a click can't silently rewrite data you didn't ask about.
+
+Results reach the watcher too: it re-primes its network cache from the database before each sweep, so IPs logged *later* in a manually-resolved block resolve from cache without a lookup of their own.
+
+Looking up an IP the log has never seen is allowed (handy for checking a block), but nothing is stored — `ip_access` records observed traffic, not WHOIS answers. If a source returns a country but no network, the country is stored and `network` stays `NULL` so the automatic sweep can still improve it later.
+
+If you're banned, it's also worth [requesting an unblock from RIPE](https://docs.db.ripe.net/FAQ#why-did-i-receive-an-error-201-access-denied) and lowering `BACKFILL_BATCH` / raising `WHOIS_DELAY` so it doesn't happen again.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `PROXY_SOURCES` | `ripestat,whoiscom` | Sources to try, in order. Drop one to disable it. |
+| `PROXY_LOOKUP_TIMEOUT` | `15` | Seconds per HTTP request. |
+| `RIPESTAT_SOURCEAPP` | `nginx-ipwatch` | Identifies this app to RIPEstat. |
+| `LOOKUP_MIN_INTERVAL` | `2.0` | Minimum seconds between lookups (per web worker). Guards against a held-down button, not an access control. |
+
 ### GeoIP databases
 
 The Docker image fetches offline databases from [sapics/ip-location-db](https://github.com/sapics/ip-location-db) at build time:
@@ -91,6 +136,7 @@ docker compose run --rm watcher python -u nginx-ipwatch.py /logs/other.log /data
 - **Sortable columns** — click any column header to sort asc/desc
 - **Pagination** — 50 rows per page
 - **Auto-refresh** — optional 30-second page reload toggle
+- **Manual lookup** — resolve an IP through a third-party WHOIS source and store the result, for when a registry has blocked automatic lookups ([details](#manual-lookup-when-a-registry-blocks-you))
 
 ## Running without Docker
 
@@ -140,7 +186,8 @@ sqlite3 data/nginx_ips.db \
 
 - The watcher starts at the **end** of the log file — it tracks new entries only, not history.
 - Log rotation is handled automatically via inode detection.
-- The web process opens the database read-only; only the watcher ever writes to it.
+- The web process opens the database read-only for all browsing. Its one write path is the manual lookup (`POST /lookup`), which uses a separate writable connection.
+- The UI has no authentication and the manual lookup makes outbound HTTP requests on demand, so keep it on a trusted network or behind your own auth — don't expose port 5000 to the internet.
 - All timestamps are stored in UTC.
 
 ## License
