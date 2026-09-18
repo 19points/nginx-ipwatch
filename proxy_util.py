@@ -40,6 +40,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
+import geojs_util
+
 TIMEOUT = float(os.environ.get("PROXY_LOOKUP_TIMEOUT", "15"))
 
 # RIPEstat asks callers to identify themselves via sourceapp so they can contact
@@ -51,7 +53,7 @@ USER_AGENT = "nginx-ipwatch (+https://github.com/19points/nginx-ipwatch)"
 
 # Order the manual lookup tries sources in. Override with PROXY_SOURCES, e.g.
 # "whoiscom" to skip RIPEstat entirely, or "ripestat" to never scrape.
-DEFAULT_SOURCES = ("ripestat", "whoiscom")
+DEFAULT_SOURCES = ("geojs", "ripestat", "whoiscom")
 
 
 @dataclass
@@ -304,7 +306,25 @@ def whoiscom_lookup(ip: str) -> LookupResult:
 # Entry point
 # ---------------------------------------------------------------------------
 
-SOURCES = {"ripestat": ripestat_lookup, "whoiscom": whoiscom_lookup}
+def geojs_lookup(ip: str) -> LookupResult:
+    """GeoJS — fast, unauthenticated, and first in line.
+
+    It has no CIDR to give (the API simply doesn't return one), so a GeoJS
+    answer alone can't fill the `network` column or seed the sibling IPs in a
+    block. lookup() therefore treats it as a partial result and keeps going —
+    see the merge logic there.
+    """
+    result = LookupResult(ip=ip, source="geojs")
+    hit = geojs_util.lookup(ip)
+    if hit is None:
+        return result
+    result.country = hit.country
+    result.netname = hit.org
+    result.asn = str(hit.asn) if hit.asn else ""
+    return result
+
+
+SOURCES = {"geojs": geojs_lookup, "ripestat": ripestat_lookup, "whoiscom": whoiscom_lookup}
 
 
 def configured_sources() -> tuple:
@@ -315,20 +335,37 @@ def configured_sources() -> tuple:
 
 
 def lookup(ip: str) -> tuple:
-    """Try each configured source until one returns something useful.
+    """Try each configured source in order until one returns a network.
 
     Returns ``(LookupResult | None, tried)`` where *tried* names the sources
     consulted, so the UI can say *what* was asked rather than just "no data".
     A source that raises is treated as a miss and the next one is tried — a
     manual lookup should degrade to "nothing found", never to a 500.
+
+    A result without a network is kept as a *partial* rather than returned:
+    the whole point of the manual lookup is the CIDR, which is what fills the
+    unresolved siblings in a block, and GeoJS (tried first) never supplies one.
+    So the search continues, and whatever the later source finds is merged with
+    the country/AS details the earlier one already gave. If nothing ever
+    produces a network, the best partial is returned — a country is still worth
+    storing.
     """
     tried = []
+    partial = None
     for name in configured_sources():
         tried.append(name)
         try:
             result = SOURCES[name](ip)
         except Exception:  # noqa: BLE001 — a broken source must not break the UI
             continue
-        if result.useful():
+        if result.network:
+            if partial is not None:
+                # Keep the earlier source's details where this one is silent.
+                result.country = result.country or partial.country
+                result.netname = result.netname or partial.netname
+                result.asn = result.asn or partial.asn
+                result.source = f"{partial.source}+{result.source}"
             return result, tried
-    return None, tried
+        if result.useful() and partial is None:
+            partial = result
+    return partial, tried
