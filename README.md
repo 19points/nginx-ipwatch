@@ -9,8 +9,19 @@ Tails an Nginx access log, performs WHOIS lookups on newly seen IP addresses, an
 | `ip` | IP address (IPv4 or IPv6) |
 | `network` | CIDR block from WHOIS (e.g. `202.46.32.0/19`) |
 | `country` | Country of registration (ISO code) |
-| `requests` | Running count of requests from this IP |
+| `requests` | Running count of requests from this IP (all time) |
 | `last_seen` | UTC timestamp of most recent request |
+
+Alongside it, `ip_hits` keeps a coarse time series — one row per IP per
+5-minute bucket with the requests made in that bucket — so the UI can report
+requests *within a window* rather than only all-time. It is trimmed to the
+retention window by the watcher:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HIT_BUCKET` | `300` | Bucket width in seconds (smaller = sharper window edges, more rows) |
+| `HIT_RETENTION_DAYS` | `8` | How long history is kept; must exceed the longest UI window (7 days) |
+| `PRUNE_INTERVAL` | `3600` | Seconds between retention sweeps |
 
 ### How IPs are resolved
 
@@ -82,11 +93,11 @@ docker compose run --rm watcher python -u nginx-ipwatch.py /logs/other.log /data
 ## Web UI features
 
 - **Two views** — per-IP (`/`) and per-network (`/networks`, aggregated by CIDR to surface coordinated activity from many IPs in one block)
-- **Stats bar** — unique IP count, total request count, country count
+- **Stats bar** — unique IP count, request count, country count (all scoped to the selected period)
 - **IP / network search** — substring match across recorded IPs or networks
 - **Country filter** — dropdown of all seen countries (with flags); clicking a badge in the table filters by that country
 - **Country flags** — flag emoji shown next to each country code
-- **Time-period filter** — scope results to an activity window by *last seen*: last hour, 3h/6h/12h/24h, today, yesterday, or last 7 days
+- **Time-period filter** — last hour, 3h/6h/12h/24h, today, yesterday, or last 7 days. Picking a window both limits the rows to IPs/networks active in it **and** scopes the request counts to it (so "Last hour" shows requests made in the last hour, not the all-time total). Windows snap outwards to whole buckets, so a count can include up to one extra `HIT_BUCKET` of older traffic. A database written before history existed falls back to filtering by *last seen* with all-time counts, and the UI says so.
 - **Exclude filters** — hide specific IPs, networks, or countries (comma-separated, multi-value); combines with the include filters
 - **Sortable columns** — click any column header to sort asc/desc
 - **Pagination** — 50 rows per page
@@ -134,6 +145,12 @@ sqlite3 data/nginx_ips.db \
 # IPs seen in the last hour
 sqlite3 data/nginx_ips.db \
   "SELECT ip, country, requests FROM ip_access WHERE last_seen >= datetime('now', '-1 hour');"
+
+# Requests made in the last hour (from the bucketed history)
+sqlite3 data/nginx_ips.db \
+  "SELECT ip, SUM(requests) AS reqs FROM ip_hits \
+   WHERE bucket >= strftime('%Y-%m-%d %H:%M:%S', 'now', '-1 hour') \
+   GROUP BY ip ORDER BY reqs DESC LIMIT 20;"
 ```
 
 ## Notes
@@ -142,6 +159,7 @@ sqlite3 data/nginx_ips.db \
 - Log rotation is handled automatically via inode detection.
 - The web process opens the database read-only; only the watcher ever writes to it.
 - All timestamps are stored in UTC.
+- Request history only reaches back to when the watcher first recorded it, and no further than `HIT_RETENTION_DAYS`.
 
 ## License
 

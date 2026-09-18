@@ -22,6 +22,13 @@ import signal
 from datetime import datetime, timezone
 
 from geoip_util import geoip_lookup, load_geoip
+from hits_util import (
+    HIT_BUCKET,
+    HIT_RETENTION_DAYS,
+    init_hits,
+    prune_hits,
+    record_hit,
+)
 from whois_util import (
     cache_add,
     cache_lookup,
@@ -54,6 +61,10 @@ WHOIS_DELAY       = float(os.environ.get("WHOIS_DELAY", "2.0"))       # seconds 
 # resolved from the network cache or deferred), so only the sweep is gated.
 RATE_LIMIT_STREAK   = int(os.environ.get("RATE_LIMIT_STREAK", "3"))     # consecutive fails that trip the breaker
 RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "3600"))  # seconds to pause the sweep after tripping
+
+# How often the per-IP request history (ip_hits) is trimmed to its retention
+# window. Cheap and indexed, so an hour is plenty.
+PRUNE_INTERVAL = int(os.environ.get("PRUNE_INTERVAL", "3600"))
 
 # monotonic deadline until which the sweep is paused (0 = not paused). Single-
 # threaded process, so a module global is enough to share state with the loop.
@@ -114,10 +125,20 @@ def init_db(conn: sqlite3.Connection) -> None:
     ).rowcount
     if healed:
         log(f"[info] reset {healed} row(s) with a bogus 0.0.0.0/0 network for re-resolution")
+    # Per-IP request history, so the UI can count requests within a time window
+    # rather than only all-time. Older DBs simply start collecting from now on.
+    init_hits(conn)
     conn.commit()
 
 
-def upsert(conn: sqlite3.Connection, ip: str, now: str) -> None:
+def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
+    """Count one request from *ip* at *now* (TS_FMT string) / *when* (datetime).
+
+    Writes both the cumulative per-IP row and the time-bucketed history row the
+    UI's period filters sum over.
+    """
+    record_hit(conn, ip, when)
+
     exists = conn.execute(
         "SELECT 1 FROM ip_access WHERE ip = ?", (ip,)
     ).fetchone()
@@ -333,12 +354,20 @@ def main() -> None:
     else:
         log("[info] geoip disabled (no GEOIP_COUNTRY_DB/GEOIP_ASN_DB) — using RDAP")
     log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/live lookup)")
+    log(f"[info] request history in {HIT_BUCKET}s buckets, kept {HIT_RETENTION_DAYS} day(s)")
 
     last_backfill = time.monotonic()
+    last_prune    = 0.0  # 0 → prune once on the first loop iteration
     for line in tail(log_path):
         if not _whois_paused() and time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
             backfill(conn, BACKFILL_BATCH, WHOIS_DELAY)
             last_backfill = time.monotonic()
+
+        if time.monotonic() - last_prune >= PRUNE_INTERVAL:
+            dropped = prune_hits(conn)
+            last_prune = time.monotonic()
+            if dropped:
+                log(f"[prune] dropped {dropped} history row(s) older than {HIT_RETENTION_DAYS} day(s)")
 
         if line is None:  # idle heartbeat — nothing to process this tick
             continue
@@ -346,8 +375,8 @@ def main() -> None:
         ip = extract_ip(line)
         if ip is None or ip in IGNORE_IPS:
             continue
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        upsert(conn, ip, now)
+        when = datetime.now(timezone.utc)
+        upsert(conn, ip, when.strftime("%Y-%m-%d %H:%M:%S"), when)
 
 
 if __name__ == "__main__":
