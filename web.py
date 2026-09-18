@@ -24,6 +24,8 @@ from flask import Flask, g, redirect, render_template, request
 
 import proxy_util
 
+from hits_util import HIT_BUCKET
+
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/data/nginx_ips.db")
@@ -32,9 +34,11 @@ SORT_COLS = {"ip", "network", "country", "requests", "last_seen"}
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
-# Activity-window options (query key -> human label). Filters rows by last_seen,
-# so it surfaces IPs/networks *active* within the window; the request counts
-# shown remain all-time cumulative (the DB stores no per-request history).
+# Activity-window options (query key -> human label). Picking one restricts
+# rows to the IPs/networks active in that window *and* scopes every request
+# count to it, by summing the bucketed history in ip_hits. Databases with no
+# history yet (written by an older watcher) fall back to filtering on last_seen
+# with all-time counts — see hits_available().
 PERIODS = {
     "all":       "All time",
     "1h":        "Last hour",
@@ -76,27 +80,83 @@ def exclude_conditions(xip: str, xnet: str, xcountry: str) -> tuple[list, list]:
     return conds, params
 
 
-def period_bounds(period: str) -> tuple[list, list]:
-    """SQL conditions restricting last_seen to *period*.
+def period_range(period: str) -> tuple:
+    """Return (start, end) UTC TS_FMT strings for *period*.
 
-    Timestamps are stored as UTC strings in TS_FMT, which sort
-    lexicographically, so plain string comparison is a valid range filter.
-    Returns ([], []) for 'all' or any unknown key.
+    *end* is None for windows that run up to now. Returns (None, None) for
+    'all' or any unknown key. Timestamps sort lexicographically, so the strings
+    can be compared directly in SQL.
     """
     now = datetime.now(timezone.utc)
     if period in _PERIOD_HOURS:
-        cutoff = (now - timedelta(hours=_PERIOD_HOURS[period])).strftime(TS_FMT)
-        return ["last_seen >= ?"], [cutoff]
+        return (now - timedelta(hours=_PERIOD_HOURS[period])).strftime(TS_FMT), None
     if period == "today":
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        return ["last_seen >= ?"], [start.strftime(TS_FMT)]
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).strftime(TS_FMT), None
     if period == "yesterday":
         end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        start = end - timedelta(days=1)
-        return ["last_seen >= ? AND last_seen < ?"], [
-            start.strftime(TS_FMT), end.strftime(TS_FMT)
-        ]
-    return [], []
+        return (end - timedelta(days=1)).strftime(TS_FMT), end.strftime(TS_FMT)
+    return None, None
+
+
+def period_bounds(period: str) -> tuple[list, list]:
+    """SQL conditions restricting last_seen to *period* (no-history fallback)."""
+    start, end = period_range(period)
+    if start is None:
+        return [], []
+    if end is None:
+        return ["last_seen >= ?"], [start]
+    return ["last_seen >= ? AND last_seen < ?"], [start, end]
+
+
+def hits_available(db: sqlite3.Connection) -> bool:
+    """True if the DB carries any bucketed request history to sum."""
+    try:
+        return db.execute("SELECT 1 FROM ip_hits LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError:
+        return False
+
+
+def history_start(db: sqlite3.Connection) -> str:
+    """Oldest bucket still retained, so the UI can say how far counts reach back."""
+    try:
+        return db.execute("SELECT MIN(bucket) FROM ip_hits").fetchone()[0] or ""
+    except sqlite3.OperationalError:
+        return ""
+
+
+def window_source(start: str, end) -> tuple:
+    """FROM clause joining ip_access to its per-IP request count within a window.
+
+    Returns (from_sql, from_params, requests_expr, last_seen_expr, ls_params).
+    The subquery aliases its key to `hip` so bare `ip`/`network`/`country`/
+    `last_seen` in the callers' filters stay unambiguous.
+
+    The window is snapped outwards to whole buckets: a bucket is included when
+    it *starts* at or after the cutoff rounded down, so "last hour" can cover up
+    to one extra bucket (HIT_BUCKET seconds) of older traffic.
+    """
+    conds, params = ["bucket >= ?"], [_floor_bucket(start)]
+    if end is not None:
+        conds.append("bucket < ?")
+        params.append(_floor_bucket(end))
+    sub = (
+        "(SELECT ip AS hip, SUM(requests) AS hits, MAX(bucket) AS hlast "
+        f"FROM ip_hits WHERE {' AND '.join(conds)} GROUP BY ip)"
+    )
+    if end is None:
+        # Window runs to now, so the row's exact last_seen is inside it.
+        return f"ip_access JOIN {sub} h ON h.hip = ip", params, "h.hits", "last_seen", []
+    # Closed window (yesterday): last_seen may be newer than the window, in
+    # which case the latest bucket in it is the best "last seen here" we have.
+    ls = "(CASE WHEN last_seen < ? THEN last_seen ELSE h.hlast END)"
+    return f"ip_access JOIN {sub} h ON h.hip = ip", params, "h.hits", ls, [end]
+
+
+def _floor_bucket(ts: str) -> str:
+    """Round a TS_FMT timestamp down onto the ip_hits bucket grid."""
+    dt = datetime.strptime(ts, TS_FMT).replace(tzinfo=timezone.utc)
+    epoch = int(dt.timestamp())
+    return datetime.fromtimestamp(epoch - epoch % HIT_BUCKET, timezone.utc).strftime(TS_FMT)
 
 # Network view sorts against aggregate aliases, so map the requested key to the
 # safe column/alias it may be interpolated into the ORDER BY as.
@@ -145,6 +205,11 @@ def get_db() -> sqlite3.Connection:
                     ip TEXT, network TEXT, country TEXT,
                     requests INTEGER, last_seen TEXT,
                     whois_attempts INTEGER, whois_next_retry TEXT
+                )
+            """)
+            g.db.execute("""
+                CREATE TABLE ip_hits (
+                    ip TEXT, bucket TEXT, requests INTEGER
                 )
             """)
         g.db.row_factory = sqlite3.Row
@@ -384,7 +449,17 @@ def index():
     sort   = sort   if sort   in SORT_COLS else "requests"
     order  = "DESC" if order != "asc" else "ASC"
 
-    period_conds, period_params = period_bounds(period)
+    # With history available the period is applied by joining the bucketed
+    # counts, which both filters the rows and scopes `requests` to the window.
+    start, end = period_range(period)
+    scoped = start is not None and hits_available(db)
+    if scoped:
+        source, src_params, req_expr, ls_expr, ls_params = window_source(start, end)
+        period_conds, period_params = [], []
+    else:
+        source, src_params = "ip_access", []
+        req_expr, ls_expr, ls_params = "requests", "last_seen", []
+        period_conds, period_params = period_bounds(period)
 
     conditions, params = list(period_conds), list(period_params)
     if search_ip:
@@ -404,15 +479,15 @@ def index():
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     total = db.execute(
-        f"SELECT COUNT(*) FROM ip_access {where}", params
+        f"SELECT COUNT(*) FROM {source} {where}", src_params + params
     ).fetchone()[0]
 
     rows = db.execute(
-        f"SELECT ip, network, country, requests, last_seen "
-        f"FROM ip_access {where} "
+        f"SELECT ip, network, country, {req_expr} AS requests, {ls_expr} AS last_seen "
+        f"FROM {source} {where} "
         f"ORDER BY {sort} {order} "
         f"LIMIT ? OFFSET ?",
-        params + [PER_PAGE, (page - 1) * PER_PAGE],
+        ls_params + src_params + params + [PER_PAGE, (page - 1) * PER_PAGE],
     ).fetchall()
 
     countries = [
@@ -427,10 +502,10 @@ def index():
     pwhere = f"WHERE {' AND '.join(period_conds)}" if period_conds else ""
     stats = db.execute(
         "SELECT COUNT(*) AS total_ips, "
-        "COALESCE(SUM(requests), 0) AS total_requests, "
+        f"COALESCE(SUM({req_expr}), 0) AS total_requests, "
         "COUNT(DISTINCT country) AS total_countries "
-        f"FROM ip_access {pwhere}",
-        period_params,
+        f"FROM {source} {pwhere}",
+        src_params + period_params,
     ).fetchone()
 
     return render_template(
@@ -441,6 +516,9 @@ def index():
         stats=stats,
         periods=PERIODS,
         period=period,
+        scoped=scoped,
+        req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
+        history_from=history_start(db) if period != "all" else "",
         # Feedback from a POST /lookup redirect, plus the current filters so the
         # lookup forms can send the user back to exactly this view.
         lookup_msg=request.args.get("lu_msg", "")[:400],
@@ -487,7 +565,15 @@ def networks():
     sort     = sort if sort in NET_SORT_COLS else "ip_count"
     order    = "DESC" if order != "asc" else "ASC"
 
-    period_conds, period_params = period_bounds(period)
+    start, end = period_range(period)
+    scoped = start is not None and hits_available(db)
+    if scoped:
+        source, src_params, req_expr, ls_expr, ls_params = window_source(start, end)
+        period_conds, period_params = [], []
+    else:
+        source, src_params = "ip_access", []
+        req_expr, ls_expr, ls_params = "requests", "last_seen", []
+        period_conds, period_params = period_bounds(period)
 
     conditions, params = list(period_conds), list(period_params)
     if search_net:
@@ -504,21 +590,21 @@ def networks():
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
     total = db.execute(
-        f"SELECT COUNT(*) FROM (SELECT 1 FROM ip_access {where} GROUP BY network)",
-        params,
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM {source} {where} GROUP BY network)",
+        src_params + params,
     ).fetchone()[0]
 
     rows = db.execute(
         f"SELECT network, "
         f"COUNT(*) AS ip_count, "
-        f"COALESCE(SUM(requests), 0) AS total_requests, "
-        f"MAX(last_seen) AS last_seen, "
+        f"COALESCE(SUM({req_expr}), 0) AS total_requests, "
+        f"MAX({ls_expr}) AS last_seen, "
         f"GROUP_CONCAT(DISTINCT country) AS countries "
-        f"FROM ip_access {where} "
+        f"FROM {source} {where} "
         f"GROUP BY network "
         f"ORDER BY {sort_sql} {order} "
         f"LIMIT ? OFFSET ?",
-        params + [PER_PAGE, (page - 1) * PER_PAGE],
+        ls_params + src_params + params + [PER_PAGE, (page - 1) * PER_PAGE],
     ).fetchall()
 
     countries = [
@@ -533,9 +619,9 @@ def networks():
     stats = db.execute(
         "SELECT COUNT(DISTINCT network) AS total_networks, "
         "COUNT(*) AS total_ips, "
-        "COALESCE(SUM(requests), 0) AS total_requests "
-        f"FROM ip_access {pwhere}",
-        period_params,
+        f"COALESCE(SUM({req_expr}), 0) AS total_requests "
+        f"FROM {source} {pwhere}",
+        src_params + period_params,
     ).fetchone()
 
     return render_template(
@@ -546,6 +632,9 @@ def networks():
         stats=stats,
         periods=PERIODS,
         period=period,
+        scoped=scoped,
+        req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
+        history_from=history_start(db) if period != "all" else "",
         search_net=search_net,
         sel_country=country,
         xip=xip,

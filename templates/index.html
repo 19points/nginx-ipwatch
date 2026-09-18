@@ -8,7 +8,7 @@
     <div class="value">{{ '{:,}'.format(stats['total_ips'] or 0) }}</div>
   </div>
   <div class="stat-card">
-    <div class="label">Total Requests</div>
+    <div class="label">{{ 'Total Requests' if not scoped else 'Requests ' ~ periods[period] | lower }}</div>
     <div class="value">{{ '{:,}'.format(stats['total_requests'] or 0) }}</div>
   </div>
   <div class="stat-card">
@@ -94,6 +94,12 @@
       <a href="/?{{ 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) }}&period=all&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear period filter">✕</a>
     </span>
   {% endif %}
+  {% if period != 'all' %}
+    <span class="filter-chip" title="{{ 'Request counts cover only the selected window' if scoped else 'No request history in this database yet — counts are all-time' }}">
+      {% if scoped %}counts for this window{% if history_from %} · history since {{ history_from }} UTC{% endif %}
+      {% else %}counts are all-time (no request history yet){% endif %}
+    </span>
+  {% endif %}
   {% for xlabel, xval in [('excl. IP', xip), ('excl. net', xnet), ('excl. country', xcountry)] if xval %}
     <span class="filter-chip">{{ xlabel }} <code>{{ xval }}</code></span>
   {% endfor %}
@@ -111,7 +117,7 @@
 <table>
   <thead>
     <tr>
-      {% set cols = [('ip','IP Address'), ('network','Network'), ('country','Country'), ('requests','Requests'), ('last_seen','Last Seen (UTC)')] %}
+      {% set cols = [('ip','IP Address'), ('network','Network'), ('country','Country'), ('requests', req_label), ('last_seen','Last Seen (UTC)')] %}
       {% for col_key, col_label in cols %}
       {% set next_order = 'asc' if (sort == col_key and order == 'DESC') else 'desc' %}
       <th>
