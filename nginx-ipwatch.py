@@ -22,7 +22,8 @@ import signal
 from datetime import datetime, timezone
 
 from geoip_util import geoip_lookup, load_geoip
-from provider_util import CATEGORIES, category_for, load_providers
+import geojs_util
+from provider_util import CATEGORIES, category_for, classify, load_providers
 from hits_util import (
     HIT_BUCKET,
     HIT_RETENTION_DAYS,
@@ -73,6 +74,14 @@ PRUNE_INTERVAL = int(os.environ.get("PRUNE_INTERVAL", "3600"))
 # wrote. Labelling is offline (prefix lists + the loaded ASN table), so this
 # costs nothing but a scan — the batch cap just keeps any single tick short.
 LABEL_BATCH = int(os.environ.get("LABEL_BATCH", "5000"))
+
+# When GeoJS is answering it is the primary source, and it resolves the pending
+# backlog in batches over HTTP rather than per-IP, so the sweep can run far more
+# often than the RDAP-paced BACKFILL_INTERVAL without being rude to anyone. This
+# is what keeps "defer new IPs to the sweep" from meaning "rows sit blank for
+# fifteen minutes". Falls back to BACKFILL_INTERVAL whenever GeoJS is off or
+# in its cooldown.
+GEOJS_INTERVAL = int(os.environ.get("GEOJS_INTERVAL", "60"))
 
 # monotonic deadline until which the sweep is paused (0 = not paused). Single-
 # threaded process, so a module global is enough to share state with the loop.
@@ -177,6 +186,12 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
             hit = cache_lookup(ip)
             if hit:
                 network, country, src = hit[0], hit[1], "cached"
+            elif geojs_util.available():
+                # GeoJS is the primary source, so don't let the bundled tables
+                # pre-empt it with a coarser answer. The row is deferred to the
+                # sweep, which asks GeoJS for the whole backlog in one request —
+                # still no live call on the log-arrival path.
+                network, country = None, None
             else:
                 geo = geoip_lookup(ip)
                 if geo is not None:
@@ -263,11 +278,22 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
     if not rows:
         return
 
-    log(f"[backfill] retrying {len(rows)} IP(s) due for a retry")
+    log(f"[backfill] resolving {len(rows)} IP(s) due for a lookup")
+
+    # One batched GeoJS request for the whole sweep, before touching anything
+    # per-IP. This is the primary source; cache hits below still win because
+    # they're free and already agreed with an earlier answer.
+    geojs_hits = geojs_util.lookup_many([ip for ip, _ in rows if not is_private(ip)])
+    if geojs_hits:
+        log(f"[backfill] geojs answered for {len(geojs_hits)}/{len(rows)} IP(s)")
+
     fails = 0
     for ip, attempts in rows:
-        # Resolve for free first (private range, cached CIDR, or offline GeoIP);
-        # only fall back to a live, throttled WHOIS for IPs none of those place.
+        # Source order: private, then the network cache (free, and consistent
+        # with what we already stored), then GeoJS, then RDAP, then the bundled
+        # GeoIP tables. GeoJS has no CIDR to give, so its country is paired with
+        # a network from the local ASN ranges — and if those miss too, RDAP is
+        # asked for the CIDR with GeoJS's country kept.
         live, source = False, ""
         if is_private(ip):
             network, country = "private", "private"
@@ -276,20 +302,45 @@ def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
             if hit:
                 network, country, source = hit[0], hit[1], "cached"
             else:
-                geo = geoip_lookup(ip)
-                if geo is not None:
-                    network, country, source = geo[0], geo[1], "geoip"
-                else:
+                geo_hit = geojs_hits.get(ip)
+                network = country = None
+                if geo_hit is not None:
+                    country, source = geo_hit.country, "geojs"
+                    local = geoip_lookup(ip)
+                    network = local[0] if local else ""
+                    if not network:
+                        # Country in hand but no CIDR anywhere offline — ask
+                        # RDAP for the block, keeping GeoJS's country.
+                        rdap_net, rdap_country = whois_lookup(ip)
+                        live = True
+                        if rdap_net is None:
+                            network = None  # RDAP failed; retry the row later
+                        else:
+                            network, source = rdap_net, "geojs+rdap"
+                            country = country or rdap_country
+                if network is None and country is None:
                     network, country = whois_lookup(ip)
                     live = True
+                    if network is None:
+                        # RDAP failed too — the bundled tables are the last resort.
+                        local = geoip_lookup(ip)
+                        if local is not None:
+                            network, country, source = local[0], local[1], "geoip"
 
         if network is not None:
             if source != "cached" and network not in ("", "private"):
                 cache_add(network, country)  # first IP of a block seeds its siblings
+            # GeoJS's AS number and name are live, so prefer them over the
+            # bundled ASN table when categorising.
+            geo_hit = geojs_hits.get(ip)
+            if geo_hit is not None and (geo_hit.asn or geo_hit.org):
+                category = classify(ip, asn=geo_hit.asn, as_name=geo_hit.org)
+            else:
+                category = "" if network == "private" else category_for(ip)
             conn.execute(
-                "UPDATE ip_access SET network = ?, country = ?, "
+                "UPDATE ip_access SET network = ?, country = ?, category = ?, "
                 "whois_attempts = whois_attempts + 1, whois_next_retry = NULL WHERE ip = ?",
-                (network, country, ip),
+                (network, country, category, ip),
             )
             conn.commit()
             log(f"[backfill] {ip:<40}  net={network or '-':<20}  country={country or '-'}"
@@ -398,6 +449,11 @@ def main() -> None:
     else:
         log("[info] geoip disabled (no GEOIP_COUNTRY_DB/GEOIP_ASN_DB) — using RDAP")
     log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/live lookup)")
+    if geojs_util.available():
+        log(f"[info] geojs is the primary source: batches of {geojs_util.GEOJS_BATCH}, "
+            f"sweeping every {GEOJS_INTERVAL}s (RDAP, then local GeoIP, are the fallbacks)")
+    else:
+        log("[info] geojs disabled (GEOJS=0) — resolving from local GeoIP, then RDAP")
     log(f"[info] request history in {HIT_BUCKET}s buckets, kept {HIT_RETENTION_DAYS} day(s)")
     if prefixes:
         log(f"[info] provider lists loaded: {prefixes} prefixes (+ ASN fallback for the rest)")
@@ -407,7 +463,11 @@ def main() -> None:
     last_backfill = time.monotonic()
     last_prune    = 0.0  # 0 → prune once on the first loop iteration
     for line in tail(log_path):
-        if not _whois_paused() and time.monotonic() - last_backfill >= BACKFILL_INTERVAL:
+        # GeoJS resolves the backlog in batched requests, so when it's up the
+        # sweep can run on a much shorter timer; without it the sweep is paced
+        # by RDAP and keeps the conservative interval.
+        interval = GEOJS_INTERVAL if geojs_util.available() else BACKFILL_INTERVAL
+        if not _whois_paused() and time.monotonic() - last_backfill >= interval:
             # Re-prime first: the web UI's manual lookups write CIDRs this
             # process has never seen. Picking them up here means a sibling IP
             # logged later resolves from cache instead of needing its own live

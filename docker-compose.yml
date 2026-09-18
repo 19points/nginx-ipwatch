@@ -13,9 +13,15 @@ services:
       # BACKFILL_INTERVAL: "900"   # seconds between retry sweeps
       # BACKFILL_BATCH: "25"       # max rows retried per sweep
       # WHOIS_DELAY: "2.0"         # seconds between live RDAP lookups
-      # Offline GeoIP tables are baked into the image (see Dockerfile) and used
-      # first, so RDAP is only a fallback. Override the paths, or set both to ""
-      # to disable GeoIP and use RDAP only:
+      # GeoJS (https://www.geojs.io) is the primary source; RDAP and the
+      # offline GeoIP tables are the fallbacks. Defaults shown:
+      # GEOJS: "1"                 # "0" disables it (GeoIP -> RDAP instead)
+      # GEOJS_BATCH: "50"          # addresses per request
+      # GEOJS_INTERVAL: "60"       # seconds between sweeps while GeoJS answers
+      # GEOJS_TIMEOUT: "10"
+      # Offline GeoIP tables are baked into the image (see Dockerfile) and are
+      # the last resort (and the first whenever GeoJS is off). Override the
+      # paths, or set both to "" to disable GeoIP:
       # GEOIP_COUNTRY_DB: /geoip/dbip-country-ipv4-num.csv,/geoip/dbip-country-ipv6-num.csv
       # GEOIP_ASN_DB: /geoip/iptoasn-asn-ipv4-num.csv,/geoip/iptoasn-asn-ipv6-num.csv
       # Per-IP request history, so the UI can count requests within a window:
@@ -38,7 +44,7 @@ services:
       # Manual WHOIS lookup (the 🔍 button / "Manual lookup" box in the UI).
       # Used when a registry has blocked this host from querying it directly.
       # Defaults shown:
-      # PROXY_SOURCES: "ripestat,whoiscom"  # order to try; drop one to disable it
+      # PROXY_SOURCES: "geojs,ripestat,whoiscom"  # order to try; drop one to disable it
       # PROXY_LOOKUP_TIMEOUT: "15"          # seconds per HTTP request
       # RIPESTAT_SOURCEAPP: "nginx-ipwatch" # identifies us to RIPEstat
       # LOOKUP_MIN_INTERVAL: "2.0"          # min seconds between lookups, per worker

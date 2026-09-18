@@ -65,14 +65,37 @@ that.
 
 ### How IPs are resolved
 
-Each new IP is resolved in this order, stopping at the first hit:
+[GeoJS](https://www.geojs.io) is the primary source, with RDAP/WHOIS and the
+bundled offline tables behind it:
 
 1. **Private** — RFC-1918 / loopback / link-local are stored as `private` with no lookup.
-2. **Network cache** — an IP inside an already-resolved CIDR reuses that block's data.
-3. **GeoIP** — offline local databases (see below) place the vast majority of IPs *instantly*, giving both country and network with **no network call and no rate limit**.
-4. **RDAP/WHOIS** — only IPs GeoIP can't place fall through to a throttled background sweep. Failures are retried with exponential backoff, guarded by a rate-limit circuit breaker. Results feed the network cache, so one lookup resolves a whole block.
+2. **Network cache** — an IP inside an already-resolved CIDR reuses that block's data, for free.
+3. **GeoJS** — queried for the country, AS number and AS name.
+4. **RDAP/WHOIS** — asked for whatever GeoJS couldn't supply, throttled and retried with exponential backoff behind a rate-limit circuit breaker.
+5. **Local GeoIP** — the offline tables, as the last resort (and the *first* resort whenever GeoJS is disabled or in a cooldown, since they answer instantly and for free).
 
-Because GeoIP handles the bulk offline, live RDAP traffic (and the rate-limiting it used to cause under scanner floods) is minimal.
+**No lookup ever happens on the log-arrival path.** A new IP is resolved from
+the cache or deferred, and the deferred backlog is resolved by a sweep that
+sends up to `GEOJS_BATCH` addresses in a *single* GeoJS request — so a scanner
+flood costs one request per 50 IPs, not one per IP. Because that is so cheap,
+the sweep runs every `GEOJS_INTERVAL` (60s) while GeoJS is answering, instead
+of the RDAP-paced `BACKFILL_INTERVAL` (900s).
+
+> **GeoJS does not return a network CIDR.** It gives country + ASN + AS name, so
+> the `network` column is still filled from the local ASN ranges, or from RDAP
+> when those miss. Everything else — country, and the AS data behind the
+> cloud/hosting/crawler marks — comes from GeoJS when it answers, which is
+> fresher than the bundled tables.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEOJS` | `1` | `0` disables GeoJS entirely; resolution reverts to GeoIP → RDAP |
+| `GEOJS_URL` | `https://get.geojs.io/v1/ip/geo.json` | Batch endpoint |
+| `GEOJS_BATCH` | `50` | Addresses per request |
+| `GEOJS_TIMEOUT` | `10` | Seconds per request |
+| `GEOJS_INTERVAL` | `60` | Seconds between sweeps while GeoJS is answering |
+| `GEOJS_FAIL_STREAK` | `3` | Consecutive failures that pause GeoJS |
+| `GEOJS_COOLDOWN` | `600` | Seconds to stay paused after that |
 
 Anything none of the four can resolve stays `NULL` and can be resolved by hand — see [Manual lookup](#manual-lookup-when-a-registry-blocks-you).
 
@@ -87,7 +110,8 @@ $ whois 78.61.136.250
 % denied because of a repeated excessive querying.
 ```
 
-The IPs then look unresolvable even though the data is perfectly public — it's your host that's blocked, not the data. The fix is to let somebody else make the registry query, which is what the **Manual lookup** box and the 🔍 button (shown on any row with no network) in the web UI do. Sources are tried in order:
+The IPs then look unresolvable even though the data is perfectly public — it's your host that's blocked, not the data. The fix is to let somebody else make the registry query, which is what the **Manual lookup** box and the 🔍 button (shown on any row with no network) in the web UI do. Sources are tried in order (GeoJS first, but since it returns no CIDR its answer
+is merged with the first source that does supply one):
 
 | Source | Notes |
 |--------|-------|
