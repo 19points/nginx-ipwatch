@@ -18,6 +18,14 @@ services:
       # to disable GeoIP and use RDAP only:
       # GEOIP_COUNTRY_DB: /geoip/dbip-country-ipv4-num.csv,/geoip/dbip-country-ipv6-num.csv
       # GEOIP_ASN_DB: /geoip/iptoasn-asn-ipv4-num.csv,/geoip/iptoasn-asn-ipv6-num.csv
+      # Per-IP request history, so the UI can count requests within a window:
+      # HIT_BUCKET: "300"          # bucket width, seconds
+      # HIT_RETENTION_DAYS: "8"    # history kept (must exceed the UI's 7d window)
+      # PRUNE_INTERVAL: "3600"     # seconds between retention + labelling sweeps
+      # Cloud/hosting/crawler marks. The published range files are baked into
+      # the image; set to "" to rely on ASN data alone:
+      # PROVIDER_DIR: /providers
+      # LABEL_BATCH: "5000"        # unlabelled rows categorised per sweep
     command: ["python", "-u", "nginx-ipwatch.py"]
 
   web:

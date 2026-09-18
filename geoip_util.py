@@ -9,7 +9,9 @@ can't place.
 
 Two independent tables, both optional:
   * a **country** table (a geolocation DB such as DB-IP Lite) → the country code
-  * an **ASN** table (e.g. IPtoASN) → the range whose bounds give the network CIDR
+  * an **ASN** table (e.g. IPtoASN) → the range whose bounds give the network
+    CIDR, plus the AS number and name behind it (see ``geoip_asn``), which
+    provider_util uses to tell rented infrastructure from consumer ISPs
 
 If neither is configured/loaded, ``geoip_lookup()`` always returns ``None`` and
 the caller falls back to RDAP. Configure via the ``GEOIP_COUNTRY_DB`` and
@@ -58,8 +60,12 @@ class _RangeTable:
 
 _country4 = _RangeTable(with_values=True)
 _country6 = _RangeTable(with_values=True)
-_asn4 = _RangeTable(with_values=False)
-_asn6 = _RangeTable(with_values=False)
+_asn4 = _RangeTable(with_values=True)   # value: AS number
+_asn6 = _RangeTable(with_values=True)
+# AS number -> name, kept once per AS rather than per range: the table has
+# ~500k ranges but only ~100k distinct ASes, so this is far cheaper than
+# storing the name on every row.
+_as_names = {}
 _loaded = False
 
 
@@ -107,6 +113,15 @@ def _load_csv(path: str, kind: str) -> int:
                 tab = _asn6 if v6 else _asn4
                 tab.s.append(start)
                 tab.e.append(end)
+                try:
+                    asn = int(row[2])
+                except (IndexError, ValueError):
+                    asn = 0
+                tab.v.append(asn)
+                if asn and asn not in _as_names and len(row) > 3:
+                    name = row[3].strip()
+                    if name:
+                        _as_names[asn] = name
             rows += 1
     return rows
 
@@ -191,3 +206,24 @@ def geoip_lookup(ip: str):
     if ci is None and ai is None:
         return None
     return network, country
+
+
+def geoip_asn(ip: str):
+    """Return (asn, as_name) for *ip*, or None if the ASN table can't place it.
+
+    The AS name is what lets a caller tell "this is a datacentre" from "this is
+    somebody's ISP" — see provider_util. Returns the number with an empty name
+    if the table has the range but no description for that AS.
+    """
+    if not _loaded:
+        return None
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    tab = _asn6 if addr.version == 6 else _asn4
+    i = tab.lookup(int(addr))
+    if i is None:
+        return None
+    asn = tab.v[i]
+    return asn, _as_names.get(asn, "")

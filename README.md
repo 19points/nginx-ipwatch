@@ -11,6 +11,7 @@ Tails an Nginx access log, performs WHOIS lookups on newly seen IP addresses, an
 | `country` | Country of registration (ISO code) |
 | `requests` | Running count of requests from this IP (all time) |
 | `last_seen` | UTC timestamp of most recent request |
+| `category` | Cloud provider, hosting/VPS or known crawler — see [What the marks mean](#what-the-marks-mean) |
 
 Alongside it, `ip_hits` keeps a coarse time series — one row per IP per
 5-minute bucket with the requests made in that bucket — so the UI can report
@@ -21,7 +22,46 @@ retention window by the watcher:
 |----------|---------|-------------|
 | `HIT_BUCKET` | `300` | Bucket width in seconds (smaller = sharper window edges, more rows) |
 | `HIT_RETENTION_DAYS` | `8` | How long history is kept; must exceed the longest UI window (7 days) |
-| `PRUNE_INTERVAL` | `3600` | Seconds between retention sweeps |
+| `PRUNE_INTERVAL` | `3600` | Seconds between retention and labelling sweeps |
+| `PROVIDER_DIR` | `/providers` | Directory of published provider range files; empty/missing = ASN data only |
+| `LABEL_BATCH` | `5000` | Unlabelled rows categorised per sweep |
+
+### What the marks mean
+
+A request from `3.91.24.7` reads differently once you know it is an EC2 box, and
+a request from `66.249.66.1` differently again once you know it is Googlebot.
+Every IP therefore carries a **category**, worked out offline in two tiers:
+
+1. **Published prefix lists** — the ranges the operators publish themselves
+   (AWS, Google Cloud, Google, Cloudflare, Googlebot and the Google special
+   crawlers, Bingbot), fetched into `/providers` at image build time. An IP
+   inside one of these is a fact, not a guess.
+2. **ASN fallback** — the IPtoASN table already loaded for GeoIP. It covers what
+   no list can: **Azure** (Microsoft's range file has no stable URL — the
+   filename carries a weekly date) and **Facebook** (published via whois), space
+   the big providers hold by *direct allocation* rather than through their cloud
+   products, and — by keyword on the AS name — the long tail of **rented VPS,
+   dedicated and colocation** operators that publish nothing at all.
+
+Crawlers beat infrastructure: Googlebot runs inside Google's own ranges, and
+"Googlebot" is the more useful thing to know. Categories are:
+
+| Mark | Meaning |
+|------|---------|
+| Googlebot / Bingbot / Facebook | A known crawler, from its operator's own published range (or AS32934 for Facebook) |
+| AWS / Google Cloud / Google / Microsoft/Azure / Cloudflare | The IP belongs to that provider |
+| Hosting/VPS | An AS that looks like rented infrastructure — a machine in a datacentre rather than somebody's connection |
+| *(no mark)* | Nothing matched; for a public IP this usually means a consumer or business ISP |
+
+The interesting scanner signal is usually **Hosting/VPS with no crawler mark**.
+An unlabelled row and an unmarked one are different things: `NULL` means the
+labeller hasn't reached it yet, `''` means it was checked and matched nothing,
+and the *Unmarked (likely ISP)* filter only shows the latter.
+
+Labels are applied as IPs arrive and backfilled for older rows during
+maintenance sweeps. Refreshing the range files (a rebuilt image) does **not**
+revisit rows already labelled — run `python backfill.py --relabel` once for
+that.
 
 ### How IPs are resolved
 
@@ -141,6 +181,7 @@ docker compose run --rm watcher python -u nginx-ipwatch.py /logs/other.log /data
 - **Stats bar** — unique IP count, request count, country count (all scoped to the selected period)
 - **IP / network search** — substring match across recorded IPs or networks
 - **Country filter** — dropdown of all seen countries (with flags); clicking a badge in the table filters by that country
+- **Type column and filter** — cloud/hosting/crawler marks with the provider's brand icon; filter by one provider, by *anything* marked, or by *unmarked (likely ISP)*. Clicking a mark filters by it
 - **Country flags** — flag emoji shown next to each country code
 - **Time-period filter** — last hour, 3h/6h/12h/24h, today, yesterday, or last 7 days. Picking a window both limits the rows to IPs/networks active in it **and** scopes the request counts to it (so "Last hour" shows requests made in the last hour, not the all-time total). Windows snap outwards to whole buckets, so a count can include up to one extra `HIT_BUCKET` of older traffic. A database written before history existed falls back to filtering by *last seen* with all-time counts, and the UI says so.
 - **Exclude filters** — hide specific IPs, networks, or countries (comma-separated, multi-value); combines with the include filters
@@ -206,6 +247,7 @@ sqlite3 data/nginx_ips.db \
 - The web process opens the database read-only for all browsing. Its one write path is the manual lookup (`POST /lookup`), which uses a separate writable connection.
 - The UI has no authentication and the manual lookup makes outbound HTTP requests on demand, so keep it on a trusted network or behind your own auth — don't expose port 5000 to the internet.
 - All timestamps are stored in UTC.
+- Provider range files are refreshed by rebuilding the image; existing rows keep their labels until `backfill.py --relabel` is run.
 - Request history only reaches back to when the watcher first recorded it, and no further than `HIT_RETENTION_DAYS`.
 
 ## License

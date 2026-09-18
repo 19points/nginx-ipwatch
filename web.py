@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, g, redirect, render_template, request
 
 import proxy_util
+from provider_util import CATEGORIES
 
 from hits_util import HIT_BUCKET
 
@@ -30,7 +31,11 @@ app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/data/nginx_ips.db")
 PER_PAGE = 50
-SORT_COLS = {"ip", "network", "country", "requests", "last_seen"}
+SORT_COLS = {"ip", "network", "country", "requests", "last_seen", "category"}
+
+# Category filter values that aren't a category key: 'any' = marked as cloud,
+# hosting or a crawler; 'none' = matched nothing (typically a consumer ISP).
+CAT_ANY, CAT_NONE = "any", "none"
 
 TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -78,6 +83,22 @@ def exclude_conditions(xip: str, xnet: str, xcountry: str) -> tuple[list, list]:
         conds.append(f"(country IS NULL OR country NOT IN ({placeholders}))")
         params.extend(xc)
     return conds, params
+
+
+def category_condition(cat: str) -> tuple:
+    """SQL condition for the category filter, or ([], []) when unset/unknown.
+
+    NULL means "not yet labelled" rather than "nothing matched", so it is
+    excluded from both the 'any' and 'none' buckets — claiming an unlabelled row
+    is a plain ISP would be inventing a result the labeller hasn't produced yet.
+    """
+    if cat == CAT_ANY:
+        return ["(category IS NOT NULL AND category != '')"], []
+    if cat == CAT_NONE:
+        return ["category = ''"], []
+    if cat in CATEGORIES:
+        return ["category = ?"], [cat]
+    return [], []
 
 
 def period_range(period: str) -> tuple:
@@ -163,6 +184,7 @@ def _floor_bucket(ts: str) -> str:
 NET_SORT_COLS = {
     "network":   "network",
     "country":   "countries",
+    "category":  "categories",
     "ip_count":  "ip_count",
     "requests":  "total_requests",
     "last_seen": "last_seen",
@@ -204,7 +226,8 @@ def get_db() -> sqlite3.Connection:
                 CREATE TABLE ip_access (
                     ip TEXT, network TEXT, country TEXT,
                     requests INTEGER, last_seen TEXT,
-                    whois_attempts INTEGER, whois_next_retry TEXT
+                    whois_attempts INTEGER, whois_next_retry TEXT,
+                    category TEXT
                 )
             """)
             g.db.execute("""
@@ -437,6 +460,7 @@ def index():
     search_ip = request.args.get("ip", "").strip()
     country   = request.args.get("country", "").strip()
     network   = request.args.get("network", "").strip()
+    cat       = request.args.get("cat", "").strip()
     period    = request.args.get("period", "all")
     xip       = request.args.get("xip", "").strip()
     xnet      = request.args.get("xnet", "").strip()
@@ -472,6 +496,10 @@ def index():
         conditions.append("network = ?")
         params.append(network)
 
+    cconds, cparams = category_condition(cat)
+    conditions += cconds
+    params += cparams
+
     xconds, xparams = exclude_conditions(xip, xnet, xcountry)
     conditions += xconds
     params += xparams
@@ -483,7 +511,8 @@ def index():
     ).fetchone()[0]
 
     rows = db.execute(
-        f"SELECT ip, network, country, {req_expr} AS requests, {ls_expr} AS last_seen "
+        f"SELECT ip, network, country, category, "
+        f"{req_expr} AS requests, {ls_expr} AS last_seen "
         f"FROM {source} {where} "
         f"ORDER BY {sort} {order} "
         f"LIMIT ? OFFSET ?",
@@ -516,6 +545,8 @@ def index():
         stats=stats,
         periods=PERIODS,
         period=period,
+        categories=CATEGORIES,
+        cat=cat,
         scoped=scoped,
         req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
         history_from=history_start(db) if period != "all" else "",
@@ -552,6 +583,7 @@ def networks():
 
     search_net = request.args.get("network", "").strip()
     country    = request.args.get("country", "").strip()
+    cat        = request.args.get("cat", "").strip()
     period     = request.args.get("period", "all")
     xip        = request.args.get("xip", "").strip()
     xnet       = request.args.get("xnet", "").strip()
@@ -583,6 +615,10 @@ def networks():
         conditions.append("country = ?")
         params.append(country)
 
+    cconds, cparams = category_condition(cat)
+    conditions += cconds
+    params += cparams
+
     xconds, xparams = exclude_conditions(xip, xnet, xcountry)
     conditions += xconds
     params += xparams
@@ -599,7 +635,8 @@ def networks():
         f"COUNT(*) AS ip_count, "
         f"COALESCE(SUM({req_expr}), 0) AS total_requests, "
         f"MAX({ls_expr}) AS last_seen, "
-        f"GROUP_CONCAT(DISTINCT country) AS countries "
+        f"GROUP_CONCAT(DISTINCT country) AS countries, "
+        f"GROUP_CONCAT(DISTINCT category) AS categories "
         f"FROM {source} {where} "
         f"GROUP BY network "
         f"ORDER BY {sort_sql} {order} "
@@ -632,6 +669,8 @@ def networks():
         stats=stats,
         periods=PERIODS,
         period=period,
+        categories=CATEGORIES,
+        cat=cat,
         scoped=scoped,
         req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
         history_from=history_start(db) if period != "all" else "",

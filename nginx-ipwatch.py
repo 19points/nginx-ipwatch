@@ -22,6 +22,7 @@ import signal
 from datetime import datetime, timezone
 
 from geoip_util import geoip_lookup, load_geoip
+from provider_util import CATEGORIES, category_for, load_providers
 from hits_util import (
     HIT_BUCKET,
     HIT_RETENTION_DAYS,
@@ -67,6 +68,12 @@ RATE_LIMIT_COOLDOWN = int(os.environ.get("RATE_LIMIT_COOLDOWN", "3600"))  # seco
 # window. Cheap and indexed, so an hour is plenty.
 PRUNE_INTERVAL = int(os.environ.get("PRUNE_INTERVAL", "3600"))
 
+# Rows whose category is still NULL are labelled in batches during maintenance:
+# legacy rows from before this column existed, and rows the manual web lookup
+# wrote. Labelling is offline (prefix lists + the loaded ASN table), so this
+# costs nothing but a scan — the batch cap just keeps any single tick short.
+LABEL_BATCH = int(os.environ.get("LABEL_BATCH", "5000"))
+
 # monotonic deadline until which the sweep is paused (0 = not paused). Single-
 # threaded process, so a module global is enough to share state with the loop.
 _whois_paused_until = 0.0
@@ -100,7 +107,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             requests         INTEGER NOT NULL DEFAULT 1,
             last_seen        TEXT NOT NULL,
             whois_attempts   INTEGER NOT NULL DEFAULT 0,
-            whois_next_retry TEXT
+            whois_next_retry TEXT,
+            category         TEXT
         )
     """)
     # Migrate DBs created before the retry-bookkeeping columns existed.
@@ -109,7 +117,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE ip_access ADD COLUMN whois_attempts INTEGER NOT NULL DEFAULT 0")
     if "whois_next_retry" not in cols:
         conn.execute("ALTER TABLE ip_access ADD COLUMN whois_next_retry TEXT")
+    if "category" not in cols:
+        # NULL, not '', so the labelling sweep picks these rows up: '' is a
+        # *result* ("looked at, matched nothing"), NULL means "not looked at".
+        conn.execute("ALTER TABLE ip_access ADD COLUMN category TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_last_seen ON ip_access (last_seen)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON ip_access (category)")
     # Partial index over just the failed rows the backfill sweep scans.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_whois_retry "
@@ -172,25 +185,54 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
                 else:
                     network, country = None, None
 
+        # Infrastructure/crawler label. Offline and independent of the WHOIS
+        # state above, so even a row deferred to the sweep gets one now.
+        category = category_for(ip) if network != "private" else ""
+
         if network is None:
             # Deferred to the sweep. No per-IP log — a flood would drown the log;
             # the sweep logs each IP when it resolves.
             conn.execute(
                 "INSERT INTO ip_access "
-                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry) "
-                "VALUES (?, NULL, NULL, 1, ?, 0, NULL)",
-                (ip, now),
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, category) "
+                "VALUES (?, NULL, NULL, 1, ?, 0, NULL, ?)",
+                (ip, now, category),
             )
         else:
             conn.execute(
                 "INSERT INTO ip_access "
-                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry) "
-                "VALUES (?, ?, ?, 1, ?, 0, NULL)",
-                (ip, network, country, now),
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, category) "
+                "VALUES (?, ?, ?, 1, ?, 0, NULL, ?)",
+                (ip, network, country, now, category),
             )
-            log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}  ({src})")
+            tag = f"  [{CATEGORIES[category][0]}]" if category else ""
+            log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}  ({src}){tag}")
 
     conn.commit()
+
+
+def label_pending(conn: sqlite3.Connection, limit: int) -> int:
+    """Give a category to up to *limit* rows that don't have one yet.
+
+    Rows arrive unlabelled from two places: a database written before the column
+    existed, and the web UI's manual lookup, which inserts nothing but does
+    update rows. Purely offline, so unlike the WHOIS sweep this has no rate
+    limit to respect and no failure mode worth retrying — a row that matches
+    nothing is stored as '' and never looked at again.
+    """
+    rows = conn.execute(
+        "SELECT ip FROM ip_access WHERE category IS NULL LIMIT ?", (limit,)
+    ).fetchall()
+    if not rows:
+        return 0
+    labelled = 0
+    for (ip,) in rows:
+        category = "" if is_private(ip) else category_for(ip)
+        conn.execute("UPDATE ip_access SET category = ? WHERE ip = ?", (category, ip))
+        if category:
+            labelled += 1
+    conn.commit()
+    return labelled
 
 
 def backfill(conn: sqlite3.Connection, limit: int, delay: float) -> None:
@@ -336,6 +378,7 @@ def main() -> None:
     init_db(conn)
     cached = prime_cache(conn)
     geo_country, geo_asn = load_geoip()
+    prefixes = load_providers()
 
     def _shutdown(sig, _frame):
         print(flush=True)  # break the ^C line before the timestamped message
@@ -356,6 +399,10 @@ def main() -> None:
         log("[info] geoip disabled (no GEOIP_COUNTRY_DB/GEOIP_ASN_DB) — using RDAP")
     log(f"[info] backfill every {BACKFILL_INTERVAL}s (batch {BACKFILL_BATCH}, {WHOIS_DELAY}s/live lookup)")
     log(f"[info] request history in {HIT_BUCKET}s buckets, kept {HIT_RETENTION_DAYS} day(s)")
+    if prefixes:
+        log(f"[info] provider lists loaded: {prefixes} prefixes (+ ASN fallback for the rest)")
+    else:
+        log("[info] no provider range files (PROVIDER_DIR) — cloud/crawler marks come from ASN data only")
 
     last_backfill = time.monotonic()
     last_prune    = 0.0  # 0 → prune once on the first loop iteration
@@ -374,9 +421,12 @@ def main() -> None:
 
         if time.monotonic() - last_prune >= PRUNE_INTERVAL:
             dropped = prune_hits(conn)
+            marked = label_pending(conn, LABEL_BATCH)
             last_prune = time.monotonic()
             if dropped:
                 log(f"[prune] dropped {dropped} history row(s) older than {HIT_RETENTION_DAYS} day(s)")
+            if marked:
+                log(f"[label] marked {marked} IP(s) as cloud/hosting/crawler")
 
         if line is None:  # idle heartbeat — nothing to process this tick
             continue
