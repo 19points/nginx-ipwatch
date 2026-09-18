@@ -55,6 +55,11 @@ def cache_lookup(ip: str):
     return None
 
 
+def cache_size() -> int:
+    """Number of CIDRs currently cached (lets callers detect newly-learned ones)."""
+    return len(_net_cache)
+
+
 def prime_cache(conn) -> int:
     """Seed the cache from networks already resolved in the DB (survives restarts)."""
     rows = conn.execute(

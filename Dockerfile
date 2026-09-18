@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY nginx-ipwatch.py web.py whois_util.py geoip_util.py backfill.py ./
+COPY nginx-ipwatch.py web.py whois_util.py geoip_util.py proxy_util.py backfill.py ./
 COPY templates/ templates/
 
 # Offline GeoIP tables from sapics/ip-location-db, fetched at build time so the

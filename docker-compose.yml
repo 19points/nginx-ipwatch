@@ -27,6 +27,13 @@ services:
       - ./data:/data
     environment:
       DB_PATH: /data/nginx_ips.db
+      # Manual WHOIS lookup (the 🔍 button / "Manual lookup" box in the UI).
+      # Used when a registry has blocked this host from querying it directly.
+      # Defaults shown:
+      # PROXY_SOURCES: "ripestat,whoiscom"  # order to try; drop one to disable it
+      # PROXY_LOOKUP_TIMEOUT: "15"          # seconds per HTTP request
+      # RIPESTAT_SOURCEAPP: "nginx-ipwatch" # identifies us to RIPEstat
+      # LOOKUP_MIN_INTERVAL: "2.0"          # min seconds between lookups, per worker
     command: ["gunicorn", "web:app", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "30"]
     ports:
       - "5000:5000"

@@ -144,6 +144,74 @@
     }
     .btn-reset:hover { background: #f0f4f9; }
 
+    /* ── Manual lookup ── */
+    /* Sits under the filter bar as its own row: it's an action that writes to
+       the DB, not another filter, so it shouldn't read as part of that form. */
+    .lookup-bar {
+      background: #fff;
+      border-bottom: 1px solid #d6e4f4;
+      padding: .7rem 2rem;
+      display: flex;
+      gap: .6rem;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: .82rem;
+      color: #555;
+    }
+    .lookup-bar input[type=text] {
+      font-family: inherit;
+      font-size: .875rem;
+      padding: .45rem .75rem;
+      border: 1px solid #b0c9e8;
+      border-radius: 6px;
+      background: #f8fbff;
+      color: #000;
+      outline: none;
+      width: 210px;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .lookup-bar input[type=text]:focus {
+      border-color: #02BD9D;
+      box-shadow: 0 0 0 3px rgba(2,189,157,.28);
+    }
+    .btn-lookup { background: #02BD9D; color: #fff; }
+    .btn-lookup:hover { background: #039e84; }
+    .lookup-hint { opacity: .8; }
+
+    /* Per-row trigger, shown where a network is missing. */
+    .lookup-inline {
+      display: inline;
+      margin-left: .4rem;
+    }
+    .btn-lookup-sm {
+      font-family: inherit;
+      font-size: .72rem;
+      font-weight: bold;
+      padding: .15em .55em;
+      border: 1px solid #9fe0d3;
+      border-radius: 5px;
+      background: #e6faf6;
+      color: #02BD9D;
+      cursor: pointer;
+      transition: background .15s, color .15s;
+    }
+    .btn-lookup-sm:hover { background: #02BD9D; color: #fff; }
+
+    /* ── Banner ── */
+    .banner {
+      margin: .85rem 2rem 0;
+      padding: .7rem 1rem;
+      border-radius: 8px;
+      font-size: .85rem;
+      display: flex;
+      align-items: flex-start;
+      gap: .55rem;
+      line-height: 1.45;
+    }
+    .banner-ok  { background: #e6faf6; border: 1px solid #9fe0d3; color: #05715f; }
+    .banner-err { background: #fff6f6; border: 1px solid #e6b8b8; color: #8a3a3a; }
+    .banner code { color: inherit; font-weight: bold; }
+
     /* ── Result meta ── */
     .result-meta {
       padding: .6rem 2rem .3rem;
