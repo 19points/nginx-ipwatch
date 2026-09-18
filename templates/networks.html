@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as ui %}
 {% block title %}nginx-ipwatch — networks{% endblock %}
 {% block content %}
 
@@ -29,6 +30,8 @@
     {% endfor %}
   </select>
 
+  {{ ui.cat_filter(categories, cat) }}
+
   <select name="period">
     {% for key, label in periods.items() %}
     <option value="{{ key }}"{% if key == period %} selected{% endif %}>{{ label }}</option>
@@ -44,6 +47,7 @@
     <option value="requests"  {% if sort == 'requests'  %}selected{% endif %}>Sort: Requests</option>
     <option value="last_seen" {% if sort == 'last_seen' %}selected{% endif %}>Sort: Last Seen</option>
     <option value="country"   {% if sort == 'country'   %}selected{% endif %}>Sort: Country</option>
+    <option value="category"  {% if sort == 'category'  %}selected{% endif %}>Sort: Type</option>
     <option value="network"   {% if sort == 'network'   %}selected{% endif %}>Sort: Network</option>
   </select>
 
@@ -57,7 +61,7 @@
 </form>
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
+{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&cat=' ~ cat ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
 <div class="result-meta">
   {% if total == 0 %}
     No results{% if search_net or sel_country %} for current filters{% endif %}.
@@ -78,6 +82,12 @@
       {% else %}counts are all-time (no request history yet){% endif %}
     </span>
   {% endif %}
+  {% if cat %}
+    <span class="filter-chip">
+      type <code>{{ categories[cat][0] if cat in categories else cat }}</code>
+      <a href="/networks?{{ 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear type filter">✕</a>
+    </span>
+  {% endif %}
   {% for xlabel, xval in [('excl. IP', xip), ('excl. net', xnet), ('excl. country', xcountry)] if xval %}
     <span class="filter-chip">{{ xlabel }} <code>{{ xval }}</code></span>
   {% endfor %}
@@ -89,7 +99,7 @@
 <table>
   <thead>
     <tr>
-      {% set cols = [('network','Network'), ('country','Country'), ('ip_count','IPs'), ('requests', req_label), ('last_seen','Last Seen (UTC)')] %}
+      {% set cols = [('network','Network'), ('country','Country'), ('category','Type'), ('ip_count','IPs'), ('requests', req_label), ('last_seen','Last Seen (UTC)')] %}
       {% for col_key, col_label in cols %}
       {% set next_order = 'asc' if (sort == col_key and order == 'DESC') else 'desc' %}
       <th>
@@ -127,6 +137,14 @@
             <a href="/networks?country={{ c }}&period={{ period }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}"
                class="badge{{ ' badge-private' if is_private else '' }}">{{ c | flag }} {{ c }}</a>{% if not loop.last %} {% endif %}
           {% endfor %}
+        {% else %}
+          <span style="color:#aaa">—</span>
+        {% endif %}
+      </td>
+      <td>
+        {% set marks = (row['categories'] or '').split(',') | map('trim') | select | list %}
+        {% if marks %}
+          {% for m in marks %}{{ ui.cat_badge(m, categories, '/networks?cat=' ~ m ~ '&period=' ~ period ~ '&sort=' ~ sort ~ '&order=' ~ ('desc' if order == 'DESC' else 'asc')) }}{% if not loop.last %} {% endif %}{% endfor %}
         {% else %}
           <span style="color:#aaa">—</span>
         {% endif %}

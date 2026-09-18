@@ -10,8 +10,15 @@ so you normally don't need this. It exists for two cases:
      result, so they can't be told apart — use --include-empty to retry every
      '' row once. Genuinely-empty IPs simply stay '' afterwards.
 
+It also carries --relabel, which is unrelated to WHOIS: it recomputes every
+row's cloud/hosting/crawler category. The watcher labels new rows as they
+arrive and fills in unlabelled ones, but an existing label is never revisited,
+so a rebuilt image with fresher provider range files needs this once to apply
+them to rows already in the table.
+
 Usage:
     python backfill.py [db_path] [--include-empty] [--limit N] [--delay SECS]
+    python backfill.py [db_path] --relabel
 
 Env:
     DB_PATH        default /data/nginx_ips.db (overridden by positional db_path)
@@ -28,6 +35,7 @@ import sys
 import time
 
 from geoip_util import geoip_lookup, load_geoip
+from provider_util import category_for, label, load_providers
 from whois_util import (
     cache_add,
     cache_lookup,
@@ -40,6 +48,39 @@ from whois_util import (
 DEFAULT_DB = "/data/nginx_ips.db"
 
 
+def relabel(db_path: str) -> None:
+    """Recompute the category of every row, reporting what changed.
+
+    Entirely offline — it reads the provider range files and the ASN table, so
+    it neither makes a network call nor cares about the WHOIS rate limit, and
+    it is safe to run against a database the watcher is using.
+    """
+    conn = sqlite3.connect(db_path, timeout=10)
+    conn.execute("PRAGMA busy_timeout = 5000")
+
+    prefixes = load_providers()
+    load_geoip()
+    if not prefixes:
+        print("Warning: no provider range files found (PROVIDER_DIR) — "
+              "labels will come from ASN data only.")
+
+    rows = conn.execute("SELECT ip, category FROM ip_access").fetchall()
+    changed = 0
+    counts = {}
+    for ip, old in rows:
+        new = "" if is_private(ip) else category_for(ip)
+        counts[new] = counts.get(new, 0) + 1
+        if new != old:
+            conn.execute("UPDATE ip_access SET category = ? WHERE ip = ?", (new, ip))
+            changed += 1
+    conn.commit()
+
+    print(f"Relabelled {len(rows)} row(s) from {db_path}: {changed} changed.")
+    for key, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {label(key) or '(unmarked)':18} {n}")
+    conn.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("db_path", nargs="?", default=os.environ.get("DB_PATH", DEFAULT_DB),
@@ -50,10 +91,17 @@ def main() -> None:
                         help="max rows to process (0 = no limit)")
     parser.add_argument("--delay", type=float, default=float(os.environ.get("WHOIS_DELAY", "2.0")),
                         help="seconds to sleep between live lookups (rate-limit friendly)")
+    parser.add_argument("--relabel", action="store_true",
+                        help="recompute every row's cloud/hosting/crawler category and exit "
+                             "(no WHOIS; use after refreshing the provider range files)")
     args = parser.parse_args()
 
     if not os.path.exists(args.db_path):
         sys.exit(f"Error: database not found: {args.db_path}")
+
+    if args.relabel:
+        relabel(args.db_path)
+        return
 
     # network IS NULL  -> lookup failed (new behaviour, always retried)
     # network = ''     -> looked up but no data (legacy failures live here too)

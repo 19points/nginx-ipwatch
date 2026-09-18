@@ -1,0 +1,36 @@
+{#
+  Shared render helpers.
+
+  cat_badge() draws the infrastructure/crawler mark for one category key: the
+  brand glyph from the sprite in base.html plus its label. Unknown or empty keys
+  render nothing at all, so callers can hand it a raw column value — an IP the
+  labeller hasn't reached yet, or one that matched nothing, simply shows no
+  badge rather than a placeholder claiming it is a plain ISP.
+#}
+{% macro cat_badge(key, categories, href='') %}
+{%- if key and key in categories -%}
+{%- set label = categories[key][0] -%}
+{%- set icon = categories[key][1] -%}
+{%- if href -%}
+<a class="cat cat-{{ icon }}" href="{{ href }}" title="Filter by {{ label }}">
+  <svg aria-hidden="true"><use href="#ic-{{ icon }}"/></svg><span class="cat-label">{{ label }}</span>
+</a>
+{%- else -%}
+<span class="cat cat-{{ icon }}">
+  <svg aria-hidden="true"><use href="#ic-{{ icon }}"/></svg><span class="cat-label">{{ label }}</span>
+</span>
+{%- endif -%}
+{%- endif -%}
+{% endmacro %}
+
+{# The category dropdown, shared by both views so the option list can't drift. #}
+{% macro cat_filter(categories, selected) %}
+<select name="cat">
+  <option value="">Any type</option>
+  <option value="any"{% if selected == 'any' %} selected{% endif %}>Cloud / hosting / crawler</option>
+  <option value="none"{% if selected == 'none' %} selected{% endif %}>Unmarked (likely ISP)</option>
+  {% for key, meta in categories.items() %}
+  <option value="{{ key }}"{% if key == selected %} selected{% endif %}>{{ meta[0] }}</option>
+  {% endfor %}
+</select>
+{% endmacro %}
