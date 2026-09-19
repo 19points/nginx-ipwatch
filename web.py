@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, g, redirect, render_template, request
 
 import proxy_util
+import client_util
 from provider_util import CATEGORIES
 
 from hits_util import HIT_BUCKET
@@ -31,7 +32,7 @@ app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/data/nginx_ips.db")
 PER_PAGE = 50
-SORT_COLS = {"ip", "network", "country", "requests", "last_seen", "category"}
+SORT_COLS = {"ip", "network", "country", "requests", "last_seen", "category", "client"}
 
 # Category filter values that aren't a category key: 'any' = marked as cloud,
 # hosting or a crawler; 'none' = matched nothing (typically a consumer ISP).
@@ -83,6 +84,55 @@ def exclude_conditions(xip: str, xnet: str, xcountry: str) -> tuple[list, list]:
         conds.append(f"(country IS NULL OR country NOT IN ({placeholders}))")
         params.extend(xc)
     return conds, params
+
+
+# Client filter values that aren't a client key.
+CLIENT_ANY, CLIENT_NONE = "any", "none"
+CLIENT_KINDS = {"crawler", "seo", "tool", "browser"}
+CLIENT_IMPERSONATING = "impersonating"
+
+
+def impersonating_conditions() -> tuple:
+    """SQL matching rows whose UA claims a crawler the IP can't belong to.
+
+    Built from client_util.VERIFIABLE so the filter and the badge the UI draws
+    are derived from one table rather than two copies of the same rule. Rows
+    with a NULL category are excluded: not yet categorised is not evidence of a
+    lie, and client_util.verdict() refuses to call it one either.
+    """
+    clauses, params = [], []
+    for client, allowed in client_util.VERIFIABLE.items():
+        placeholders = ",".join("?" * len(allowed))
+        clauses.append(f"(client = ? AND category IS NOT NULL AND category NOT IN ({placeholders}))")
+        params.append(client)
+        params.extend(allowed)
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def client_condition(value: str) -> tuple:
+    """SQL condition for the client filter, or ([], []) when unset/unknown.
+
+    Accepts a client key, a kind ('tool', 'crawler', ...), 'any' (the UA named
+    something recognisable), 'none' (it didn't), or 'impersonating'.
+    """
+    if not value:
+        return [], []
+    if value == CLIENT_IMPERSONATING:
+        clause, params = impersonating_conditions()
+        return [clause], params
+    if value == CLIENT_ANY:
+        return ["(client IS NOT NULL AND client != '')"], []
+    if value == CLIENT_NONE:
+        return ["(client IS NULL OR client = '')"], []
+    if value in CLIENT_KINDS:
+        keys = [k for k, meta in client_util.CLIENTS.items() if meta[1] == value]
+        if not keys:
+            return [], []
+        placeholders = ",".join("?" * len(keys))
+        return [f"client IN ({placeholders})"], keys
+    if value in client_util.CLIENTS:
+        return ["client = ?"], [value]
+    return [], []
 
 
 def category_condition(cat: str) -> tuple:
@@ -227,7 +277,7 @@ def get_db() -> sqlite3.Connection:
                     ip TEXT, network TEXT, country TEXT,
                     requests INTEGER, last_seen TEXT,
                     whois_attempts INTEGER, whois_next_retry TEXT,
-                    category TEXT
+                    category TEXT, client TEXT, user_agent TEXT
                 )
             """)
             g.db.execute("""
@@ -461,6 +511,7 @@ def index():
     country   = request.args.get("country", "").strip()
     network   = request.args.get("network", "").strip()
     cat       = request.args.get("cat", "").strip()
+    client    = request.args.get("client", "").strip()
     period    = request.args.get("period", "all")
     xip       = request.args.get("xip", "").strip()
     xnet      = request.args.get("xnet", "").strip()
@@ -500,6 +551,10 @@ def index():
     conditions += cconds
     params += cparams
 
+    clconds, clparams = client_condition(client)
+    conditions += clconds
+    params += clparams
+
     xconds, xparams = exclude_conditions(xip, xnet, xcountry)
     conditions += xconds
     params += xparams
@@ -511,7 +566,7 @@ def index():
     ).fetchone()[0]
 
     rows = db.execute(
-        f"SELECT ip, network, country, category, "
+        f"SELECT ip, network, country, category, client, user_agent, "
         f"{req_expr} AS requests, {ls_expr} AS last_seen "
         f"FROM {source} {where} "
         f"ORDER BY {sort} {order} "
@@ -550,6 +605,12 @@ def index():
         scoped=scoped,
         req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
         history_from=history_start(db) if period != "all" else "",
+        clients=client_util.CLIENTS,
+        client=client,
+        client_label=client_util.label,
+        # The verdict compares the UA's claim with the IP's category, so the
+        # template needs the function rather than a precomputed column.
+        client_verdict=client_util.verdict,
         # Feedback from a POST /lookup redirect, plus the current filters so the
         # lookup forms can send the user back to exactly this view.
         lookup_msg=request.args.get("lu_msg", "")[:400],
@@ -584,6 +645,7 @@ def networks():
     search_net = request.args.get("network", "").strip()
     country    = request.args.get("country", "").strip()
     cat        = request.args.get("cat", "").strip()
+    client     = request.args.get("client", "").strip()
     period     = request.args.get("period", "all")
     xip        = request.args.get("xip", "").strip()
     xnet       = request.args.get("xnet", "").strip()
@@ -618,6 +680,13 @@ def networks():
     cconds, cparams = category_condition(cat)
     conditions += cconds
     params += cparams
+
+    # Applied per IP before grouping, so filtering by e.g. 'impersonating'
+    # answers "which networks hold IPs doing that" rather than reshaping the
+    # aggregate — the IP and request counts then cover only the matching rows.
+    clconds, clparams = client_condition(client)
+    conditions += clconds
+    params += clparams
 
     xconds, xparams = exclude_conditions(xip, xnet, xcountry)
     conditions += xconds
@@ -671,6 +740,8 @@ def networks():
         period=period,
         categories=CATEGORIES,
         cat=cat,
+        clients=client_util.CLIENTS,
+        client=client,
         scoped=scoped,
         req_label="Requests" if not scoped else f"Requests ({PERIODS[period].lower()})",
         history_from=history_start(db) if period != "all" else "",

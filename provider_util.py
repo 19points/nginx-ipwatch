@@ -258,6 +258,17 @@ def classify(ip: str, asn: int = None, as_name: str = "") -> str:
     return ""
 
 
+def data_loaded() -> bool:
+    """True if there is anything at all to classify against.
+
+    With neither the prefix lists nor the ASN table loaded, every lookup would
+    return '' — and '' means "checked, matched nothing", which is never revisited.
+    Callers that persist a result check this first so a misconfigured deployment
+    doesn't permanently mark every IP as unremarkable.
+    """
+    return bool(_tables) or geoip_asn("8.8.8.8") is not None
+
+
 def category_for(ip: str) -> str:
     """Category for *ip*, pulling the ASN tier straight from the GeoIP tables.
 

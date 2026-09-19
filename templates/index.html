@@ -32,6 +32,8 @@
 
   {{ ui.cat_filter(categories, cat) }}
 
+  {{ ui.client_filter(clients, client) }}
+
   <select name="period">
     {% for key, label in periods.items() %}
     <option value="{{ key }}"{% if key == period %} selected{% endif %}>{{ label }}</option>
@@ -47,6 +49,7 @@
     <option value="last_seen" {% if sort == 'last_seen' %}selected{% endif %}>Sort: Last Seen</option>
     <option value="country"   {% if sort == 'country'   %}selected{% endif %}>Sort: Country</option>
     <option value="category"  {% if sort == 'category'  %}selected{% endif %}>Sort: Type</option>
+    <option value="client"    {% if sort == 'client'    %}selected{% endif %}>Sort: Client</option>
     <option value="ip"        {% if sort == 'ip'        %}selected{% endif %}>Sort: IP</option>
     <option value="network"   {% if sort == 'network'   %}selected{% endif %}>Sort: Network</option>
   </select>
@@ -83,7 +86,7 @@
 {% endif %}
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&cat=' ~ cat ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
+{% set base_qs = 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&cat=' ~ cat ~ '&client=' ~ client ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
 <div class="result-meta">
   {% if total == 0 %}
     No results{% if search_ip or sel_country or network %} for current filters{% endif %}.
@@ -102,6 +105,12 @@
     <span class="filter-chip" title="{{ 'Request counts cover only the selected window' if scoped else 'No request history in this database yet — counts are all-time' }}">
       {% if scoped %}counts for this window{% if history_from %} · history since {{ history_from }} UTC{% endif %}
       {% else %}counts are all-time (no request history yet){% endif %}
+    </span>
+  {% endif %}
+  {% if client %}
+    <span class="filter-chip">
+      client <code>{{ clients[client][0] if client in clients else client }}</code>
+      <a href="/?{{ 'ip=' ~ search_ip ~ '&country=' ~ sel_country ~ '&network=' ~ (network | urlencode) ~ '&cat=' ~ cat ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear client filter">✕</a>
     </span>
   {% endif %}
   {% if cat %}
@@ -127,7 +136,7 @@
 <table>
   <thead>
     <tr>
-      {% set cols = [('ip','IP Address'), ('network','Network'), ('country','Country'), ('category','Type'), ('requests', req_label), ('last_seen','Last Seen (UTC)')] %}
+      {% set cols = [('ip','IP Address'), ('network','Network'), ('country','Country'), ('category','Type'), ('client','Client (claimed)'), ('requests', req_label), ('last_seen','Last Seen (UTC)')] %}
       {% for col_key, col_label in cols %}
       {% set next_order = 'asc' if (sort == col_key and order == 'DESC') else 'desc' %}
       <th>
@@ -176,6 +185,13 @@
       <td>
         {% if row['category'] %}
           {{ ui.cat_badge(row['category'], categories, '/?cat=' ~ row['category'] ~ '&period=' ~ period ~ '&sort=' ~ sort ~ '&order=' ~ ('desc' if order == 'DESC' else 'asc')) }}
+        {% else %}
+          <span style="color:#aaa">—</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if row['client'] or row['user_agent'] %}
+          {{ ui.client_cell(row['client'], row['user_agent'], client_verdict(row['client'], row['category']), client_label) }}
         {% else %}
           <span style="color:#aaa">—</span>
         {% endif %}

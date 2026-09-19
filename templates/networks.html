@@ -32,6 +32,8 @@
 
   {{ ui.cat_filter(categories, cat) }}
 
+  {{ ui.client_filter(clients, client) }}
+
   <select name="period">
     {% for key, label in periods.items() %}
     <option value="{{ key }}"{% if key == period %} selected{% endif %}>{{ label }}</option>
@@ -61,7 +63,7 @@
 </form>
 
 <!-- ── Result count ───────────────────────────────────────── -->
-{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&cat=' ~ cat ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
+{% set base_qs = 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&cat=' ~ cat ~ '&client=' ~ client ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) %}
 <div class="result-meta">
   {% if total == 0 %}
     No results{% if search_net or sel_country %} for current filters{% endif %}.
@@ -80,6 +82,12 @@
     <span class="filter-chip" title="{{ 'Request counts cover only the selected window' if scoped else 'No request history in this database yet — counts are all-time' }}">
       {% if scoped %}counts for this window{% if history_from %} · history since {{ history_from }} UTC{% endif %}
       {% else %}counts are all-time (no request history yet){% endif %}
+    </span>
+  {% endif %}
+  {% if client %}
+    <span class="filter-chip">
+      client <code>{{ clients[client][0] if client in clients else client }}</code>
+      <a href="/networks?{{ 'network=' ~ (search_net | urlencode) ~ '&country=' ~ sel_country ~ '&cat=' ~ cat ~ '&period=' ~ period ~ '&xip=' ~ (xip | urlencode) ~ '&xnet=' ~ (xnet | urlencode) ~ '&xcountry=' ~ (xcountry | urlencode) }}&sort={{ sort }}&order={{ 'desc' if order == 'DESC' else 'asc' }}" title="Clear client filter">✕</a>
     </span>
   {% endif %}
   {% if cat %}

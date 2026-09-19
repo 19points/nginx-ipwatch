@@ -34,3 +34,44 @@
   {% endfor %}
 </select>
 {% endmacro %}
+
+{#
+  client_cell() renders what the client claimed to be, next to the verdict that
+  compares the claim with the IP's category. The User-Agent is attacker-supplied
+  text, so it is shown truncated (full string on hover) and never treated as
+  anything but a quotation — Jinja's autoescaping is what keeps it inert.
+#}
+{% macro client_cell(client, ua, verdict_key, client_label) %}
+{%- if client -%}
+<span class="client">
+  <span class="client-name">{{ client_label(client) }}</span>
+  {%- if verdict_key %}
+  <span class="verdict verdict-{{ verdict_key }}"
+        title="{{ {'verified': 'The IP is in this crawler\'s published range',
+                   'unverified': 'The IP belongs to the operator but is not in the published crawler range',
+                   'impersonating': 'The UA claims a crawler this IP cannot belong to',
+                   'declared': 'Self-reported; this client publishes no ranges to check against'}[verdict_key] }}">{{ verdict_key }}</span>
+  {%- endif %}
+</span>
+{%- if ua %}<span class="client-ua" title="{{ ua }}">{{ ua }}</span>{% endif -%}
+{%- elif ua -%}
+<span class="client-ua" title="{{ ua }}">{{ ua }}</span>
+{%- endif -%}
+{% endmacro %}
+
+{# Client dropdown, shared by both views. #}
+{% macro client_filter(clients, selected) %}
+<select name="client">
+  <option value="">Any client</option>
+  <option value="impersonating"{% if selected == 'impersonating' %} selected{% endif %}>⚠ Impersonating a crawler</option>
+  <option value="any"{% if selected == 'any' %} selected{% endif %}>Any recognised bot/tool</option>
+  <option value="crawler"{% if selected == 'crawler' %} selected{% endif %}>Search crawlers</option>
+  <option value="seo"{% if selected == 'seo' %} selected{% endif %}>SEO / AI crawlers</option>
+  <option value="tool"{% if selected == 'tool' %} selected{% endif %}>Tools &amp; libraries</option>
+  <option value="browser"{% if selected == 'browser' %} selected{% endif %}>Browsers</option>
+  <option value="none"{% if selected == 'none' %} selected{% endif %}>Unrecognised / no UA</option>
+  {% for key, meta in clients.items() if meta[1] != 'browser' %}
+  <option value="{{ key }}"{% if key == selected %} selected{% endif %}>{{ meta[0] }}</option>
+  {% endfor %}
+</select>
+{% endmacro %}
