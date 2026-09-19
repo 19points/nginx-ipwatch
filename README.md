@@ -12,6 +12,8 @@ Tails an Nginx access log, performs WHOIS lookups on newly seen IP addresses, an
 | `requests` | Running count of requests from this IP (all time) |
 | `last_seen` | UTC timestamp of most recent request |
 | `category` | Cloud provider, hosting/VPS or known crawler — see [What the marks mean](#what-the-marks-mean) |
+| `client` | What the User-Agent claimed to be — see [Client claims](#client-claims-and-fake-crawlers) |
+| `user_agent` | The most recent User-Agent string seen from this IP (capped at 300 chars) |
 
 Alongside it, `ip_hits` keeps a coarse time series — one row per IP per
 5-minute bucket with the requests made in that bucket — so the UI can report
@@ -62,6 +64,37 @@ Labels are applied as IPs arrive and backfilled for older rows during
 maintenance sweeps. Refreshing the range files (a rebuilt image) does **not**
 revisit rows already labelled — run `python backfill.py --relabel` once for
 that.
+
+### Client claims and fake crawlers
+
+The watcher also reads the **User-Agent** from each log line. Unlike everything
+else here, a UA is not evidence: it is typed by whoever sent the request.
+`Googlebot/2.1` arriving from a rented VPS is simply a lie, and a common one.
+
+So the claim is stored as a claim, and shown next to a **verdict** that compares
+it with the IP's category — the part that can't be faked:
+
+| Verdict | Means |
+|---------|-------|
+| `verified` | The IP is inside that crawler's published range |
+| `unverified` | The IP belongs to the operator, but isn't in the published crawler range |
+| `impersonating` | The UA claims a crawler the IP cannot belong to |
+| `declared` | Self-reported, and uncheckable — SEO crawlers and HTTP libraries publish no ranges |
+
+Only Googlebot, Bingbot and Facebook can be checked this way, because only they
+publish the ranges. Everything else (AhrefsBot, GPTBot, curl, python-requests,
+zgrab, sqlmap…) is reported as *declared* — the claim, never a fact.
+
+Filter the IP view by **⚠ Impersonating a crawler** to see the fakes, or by
+**Tools & libraries** for clients that aren't pretending to be browsers at all.
+
+> **Log format:** the UA is read as the last quoted field, which is where
+> nginx's stock `combined` format puts it. A custom `log_format` that moves or
+> omits `$http_user_agent` simply yields no client — nothing else breaks.
+>
+> An IP that presents several User-Agents is shown as **whatever it sent last**;
+> only one is stored. A scanner that mostly sends a browser UA and occasionally
+> a bot one will therefore flip between them.
 
 ### How IPs are resolved
 
@@ -205,6 +238,7 @@ docker compose run --rm watcher python -u nginx-ipwatch.py /logs/other.log /data
 - **Stats bar** — unique IP count, request count, country count (all scoped to the selected period)
 - **IP / network search** — substring match across recorded IPs or networks
 - **Country filter** — dropdown of all seen countries (with flags); clicking a badge in the table filters by that country
+- **Client column** — what the User-Agent claimed, with a verdict badge (verified / unverified / impersonating / declared) and the raw UA on hover; filter by a specific bot, by kind, or by *impersonating*
 - **Type column and filter** — cloud/hosting/crawler marks with the provider's brand icon; filter by one provider, by *anything* marked, or by *unmarked (likely ISP)*. Clicking a mark filters by it
 - **Country flags** — flag emoji shown next to each country code
 - **Time-period filter** — last hour, 3h/6h/12h/24h, today, yesterday, or last 7 days. Picking a window both limits the rows to IPs/networks active in it **and** scopes the request counts to it (so "Last hour" shows requests made in the last hour, not the all-time total). Windows snap outwards to whole buckets, so a count can include up to one extra `HIT_BUCKET` of older traffic. A database written before history existed falls back to filtering by *last seen* with all-time counts, and the UI says so.

@@ -35,7 +35,7 @@ import sys
 import time
 
 from geoip_util import geoip_lookup, load_geoip
-from provider_util import category_for, label, load_providers
+from provider_util import category_for, data_loaded, label, load_providers
 from whois_util import (
     cache_add,
     cache_lookup,
@@ -63,6 +63,10 @@ def relabel(db_path: str) -> None:
     if not prefixes:
         print("Warning: no provider range files found (PROVIDER_DIR) — "
               "labels will come from ASN data only.")
+    if not data_loaded():
+        sys.exit("Error: no provider range files and no ASN table loaded — "
+                 "relabelling now would mark every IP as unmatched. "
+                 "Check PROVIDER_DIR and GEOIP_ASN_DB.")
 
     rows = conn.execute("SELECT ip, category FROM ip_access").fetchall()
     changed = 0

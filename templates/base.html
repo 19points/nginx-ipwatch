@@ -331,6 +331,35 @@
     .cat-facebook { color: #0866FF; }
     .cat-hosting { color: #3E7CB1; }
 
+
+    /* ── Client claim (User-Agent) ── */
+    .client { display: inline-flex; align-items: baseline; gap: .4em; flex-wrap: wrap; }
+    .client-name { font-weight: bold; color: #054A91; font-size: .82rem; }
+    .client-ua {
+      display: block;
+      max-width: 22ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: .7rem;
+      color: #7a8894;
+      font-family: ui-monospace, Menlo, Consolas, monospace;
+    }
+    .verdict {
+      padding: .1em .45em;
+      border-radius: 4px;
+      font-size: .68rem;
+      font-weight: bold;
+      text-transform: uppercase;
+      letter-spacing: .02em;
+      white-space: nowrap;
+    }
+    /* Verified is reassuring, impersonating is the one that must catch the eye. */
+    .verdict-verified      { background: #d8f5ee; color: #04755f; }
+    .verdict-unverified    { background: #fdf0d5; color: #8a5a00; }
+    .verdict-declared      { background: #eef1f4; color: #5b6770; }
+    .verdict-impersonating { background: #fde2e1; color: #a11916; }
+
     .req-count { font-weight: bold; color: #054A91; }
     .ip-count { font-weight: bold; color: #02BD9D; }
     .ts { color: #555; font-size: .82rem; white-space: nowrap; }

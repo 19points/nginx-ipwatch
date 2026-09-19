@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 
 from geoip_util import geoip_lookup, load_geoip
 import geojs_util
-from provider_util import CATEGORIES, category_for, classify, load_providers
+from client_util import classify_client, extract_user_agent
+from provider_util import CATEGORIES, category_for, classify, data_loaded, load_providers
 from hits_util import (
     HIT_BUCKET,
     HIT_RETENTION_DAYS,
@@ -117,7 +118,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             last_seen        TEXT NOT NULL,
             whois_attempts   INTEGER NOT NULL DEFAULT 0,
             whois_next_retry TEXT,
-            category         TEXT
+            category         TEXT,
+            client           TEXT,
+            user_agent       TEXT
         )
     """)
     # Migrate DBs created before the retry-bookkeeping columns existed.
@@ -130,8 +133,16 @@ def init_db(conn: sqlite3.Connection) -> None:
         # NULL, not '', so the labelling sweep picks these rows up: '' is a
         # *result* ("looked at, matched nothing"), NULL means "not looked at".
         conn.execute("ALTER TABLE ip_access ADD COLUMN category TEXT")
+    # What the client claimed to be, from the User-Agent. Unlike category these
+    # need no sweep — they come from the log line itself, so older rows simply
+    # fill in as those IPs are seen again.
+    if "client" not in cols:
+        conn.execute("ALTER TABLE ip_access ADD COLUMN client TEXT")
+    if "user_agent" not in cols:
+        conn.execute("ALTER TABLE ip_access ADD COLUMN user_agent TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_last_seen ON ip_access (last_seen)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_category ON ip_access (category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_client ON ip_access (client)")
     # Partial index over just the failed rows the backfill sweep scans.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_whois_retry "
@@ -154,11 +165,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
+def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime, ua: str = "") -> None:
     """Count one request from *ip* at *now* (TS_FMT string) / *when* (datetime).
 
-    Writes both the cumulative per-IP row and the time-bucketed history row the
-    UI's period filters sum over.
+    Writes the cumulative per-IP row, the time-bucketed history row the UI's
+    period filters sum over, and the client claimed by *ua* (the User-Agent from
+    the log line). The newest User-Agent wins: an IP that presents several is
+    shown as whatever it said last, which is the honest summary of a single
+    stored value — the claim is evidence about the request, not about the IP.
     """
     record_hit(conn, ip, when)
 
@@ -166,11 +180,22 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
         "SELECT 1 FROM ip_access WHERE ip = ?", (ip,)
     ).fetchone()
 
+    client = classify_client(ua)
+
     if exists:
-        conn.execute(
-            "UPDATE ip_access SET requests = requests + 1, last_seen = ? WHERE ip = ?",
-            (now, ip),
-        )
+        if ua:
+            conn.execute(
+                "UPDATE ip_access SET requests = requests + 1, last_seen = ?, "
+                "client = ?, user_agent = ? WHERE ip = ?",
+                (now, client, ua, ip),
+            )
+        else:
+            # No UA on this line — leave whatever the IP last told us in place
+            # rather than blanking a known claim.
+            conn.execute(
+                "UPDATE ip_access SET requests = requests + 1, last_seen = ? WHERE ip = ?",
+                (now, ip),
+            )
     else:
         # New IP — resolve WITHOUT a live WHOIS call whenever possible:
         #   - private/loopback ranges have no public WHOIS (resolve locally)
@@ -209,16 +234,18 @@ def upsert(conn: sqlite3.Connection, ip: str, now: str, when: datetime) -> None:
             # the sweep logs each IP when it resolves.
             conn.execute(
                 "INSERT INTO ip_access "
-                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, category) "
-                "VALUES (?, NULL, NULL, 1, ?, 0, NULL, ?)",
-                (ip, now, category),
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, "
+                "category, client, user_agent) "
+                "VALUES (?, NULL, NULL, 1, ?, 0, NULL, ?, ?, ?)",
+                (ip, now, category, client, ua),
             )
         else:
             conn.execute(
                 "INSERT INTO ip_access "
-                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, category) "
-                "VALUES (?, ?, ?, 1, ?, 0, NULL, ?)",
-                (ip, network, country, now, category),
+                "(ip, network, country, requests, last_seen, whois_attempts, whois_next_retry, "
+                "category, client, user_agent) "
+                "VALUES (?, ?, ?, 1, ?, 0, NULL, ?, ?, ?)",
+                (ip, network, country, now, category, client, ua),
             )
             tag = f"  [{CATEGORIES[category][0]}]" if category else ""
             log(f"[new]  {ip:<40}  net={network or '-':<20}  country={country or '-'}  ({src}){tag}")
@@ -235,6 +262,10 @@ def label_pending(conn: sqlite3.Connection, limit: int) -> int:
     limit to respect and no failure mode worth retrying — a row that matches
     nothing is stored as '' and never looked at again.
     """
+    if not data_loaded():
+        # Nothing to classify against — labelling now would write '' everywhere
+        # and those rows would never be reconsidered.
+        return 0
     rows = conn.execute(
         "SELECT ip FROM ip_access WHERE category IS NULL LIMIT ?", (limit,)
     ).fetchall()
@@ -495,7 +526,7 @@ def main() -> None:
         if ip is None or ip in IGNORE_IPS:
             continue
         when = datetime.now(timezone.utc)
-        upsert(conn, ip, when.strftime("%Y-%m-%d %H:%M:%S"), when)
+        upsert(conn, ip, when.strftime("%Y-%m-%d %H:%M:%S"), when, extract_user_agent(line))
 
 
 if __name__ == "__main__":
